@@ -1,4 +1,5 @@
 """Sidebar for the main window"""
+import locale
 from gettext import gettext as _
 
 from gi.repository import GLib, GObject, Gtk, Pango
@@ -216,6 +217,32 @@ class RunnerSidebarRow(SidebarRow):
                                      runner=self.runner, parent=self.get_toplevel())
 
 
+class CategorySidebarRow(SidebarRow):
+
+    def __init__(self, category):
+        super().__init__(
+            category['name'],
+            "category",
+            category['name'],
+            Gtk.Image.new_from_icon_name("folder-symbolic", Gtk.IconSize.MENU)
+        )
+        self.category = category
+
+        self._sort_name = locale.strxfrm(category['name'])
+
+    def __lt__(self, other):
+        if not isinstance(other, CategorySidebarRow):
+            raise ValueError('Cannot compare %s to %s' % (self.__class__.__name__, other.__class__.__name__))
+
+        return self._sort_name < other._sort_name
+
+    def __gt__(self, other):
+        if not isinstance(other, CategorySidebarRow):
+            raise ValueError('Cannot compare %s to %s' % (self.__class__.__name__, other.__class__.__name__))
+
+        return self._sort_name > other._sort_name
+
+
 class SidebarHeader(Gtk.Box):
     """Header shown on top of each sidebar section"""
 
@@ -260,6 +287,7 @@ class LutrisSidebar(Gtk.ListBox):
         self.runners = None
         self.platforms = None
         self.categories = None
+        self.category_rows = {}
         # A dummy objects that allows inspecting why/when we have a show() call on the object.
         self.running_row = DummyRow()
         if selected:
@@ -271,6 +299,7 @@ class LutrisSidebar(Gtk.ListBox):
             "sources": SidebarHeader(_("Sources")),
             "runners": SidebarHeader(_("Runners")),
             "platforms": SidebarHeader(_("Platforms")),
+            "categories": SidebarHeader(_("Categories")),
         }
         GObject.add_emission_hook(RunnerBox, "runner-installed", self.update)
         GObject.add_emission_hook(RunnerBox, "runner-removed", self.update)
@@ -308,7 +337,6 @@ class LutrisSidebar(Gtk.ListBox):
         self.active_platforms = games_db.get_used_platforms()
         self.runners = sorted(runners.__all__)
         self.platforms = sorted(runners.RUNNER_PLATFORMS)
-        self.categories = categories_db.get_categories()
 
         self.add(
             SidebarRow(
@@ -397,14 +425,63 @@ class LutrisSidebar(Gtk.ListBox):
             row.set_header(self.row_headers["runners"])
         elif before.type == "runner" and row.type == "platform":
             row.set_header(self.row_headers["platforms"])
+        elif not isinstance(before, CategorySidebarRow) and isinstance(row, CategorySidebarRow):
+            row.set_header(self.row_headers["categories"])
         else:
             row.set_header(None)
 
     def update(self, *_args):
         self.installed_runners = [runner.name for runner in runners.get_installed()]
         self.active_platforms = games_db.get_used_platforms()
+        self.update_categories()
         self.invalidate_filter()
         return True
+
+    def update_categories(self):
+        """update category list in sidebar"""
+        categories_db.remove_unused_categories()
+
+        self.categories = [c for c in categories_db.get_categories() if c['name'] != 'favorite']
+
+        category_names = {category['name'] for category in self.categories}
+
+        # handle now removed categories
+        removed_categories = []
+        for sidebar_category, category_row in self.category_rows.items():
+            if sidebar_category not in category_names:
+                self.remove(category_row)
+                removed_categories.append(sidebar_category)
+        for rem_category in removed_categories:
+            del self.category_rows[rem_category]
+
+        for category in self.categories:
+            category_name = category['name']
+            # handle added category
+            if category_name not in self.category_rows:
+                new_category_row = CategorySidebarRow(category)
+                self.category_rows[category_name] = new_category_row
+
+                # look for proper place to insert new row
+                target_idx = None
+                row_idx = 0
+                cur_row = None
+                while cur_row is not None or row_idx == 0:
+                    cur_row = self.get_row_at_index(row_idx)
+
+                    # encountered category row whose alphabetical order is after row to add, insert here
+                    if isinstance(cur_row, CategorySidebarRow) and cur_row > new_category_row:
+                        target_idx = row_idx
+                        break
+                    # encountered first service row -> end of category list, insert here
+                    if cur_row.type == 'service':
+                        target_idx = row_idx
+                        break
+
+                    row_idx += 1
+
+                self.insert(new_category_row, target_idx)
+
+        self.show_all()
 
     def on_game_start(self, _game):
         """Show the "running" section when a game start"""
