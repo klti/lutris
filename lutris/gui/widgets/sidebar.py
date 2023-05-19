@@ -5,6 +5,7 @@ from gettext import gettext as _
 from gi.repository import GLib, GObject, Gtk, Pango
 
 from lutris import runners, services
+from lutris.database import categories as categories_db
 from lutris.database import games as games_db
 from lutris.exceptions import watch_errors
 from lutris.game import Game
@@ -12,7 +13,7 @@ from lutris.gui import dialogs
 from lutris.gui.config.runner import RunnerConfigDialog
 from lutris.gui.config.runner_box import RunnerBox
 from lutris.gui.config.services_box import ServicesBox
-from lutris.gui.config .edit_categoriy_games import EditCategoryGamesDialog
+from lutris.gui.config.edit_category_games import EditCategoryGamesDialog
 from lutris.gui.dialogs import ErrorDialog
 from lutris.gui.dialogs.runner_install import RunnerInstallDialog
 from lutris.gui.widgets.utils import has_stock_icon
@@ -258,7 +259,7 @@ class CategorySidebarRow(SidebarRow):
     def __init__(self, category, application):
         super().__init__(
             category['name'],
-            "category",
+            "user_category",
             category['name'],
             Gtk.Image.new_from_icon_name("folder-symbolic", Gtk.IconSize.MENU),
             application=application
@@ -446,7 +447,7 @@ class LutrisSidebar(Gtk.ListBox):
 
     @selected_category.setter
     def selected_category(self, value):
-        """Selects the rrow for the category indicated by a category tuple,
+        """Selects the row for the category indicated by a category tuple,
         like ('service', 'lutris')"""
         selected_row_type, selected_row_id = value or ("category", "all")
         for row in self.get_children():
@@ -457,6 +458,8 @@ class LutrisSidebar(Gtk.ListBox):
     def _filter_func(self, row):
         if not row or not row.id or row.type in ("category", "dynamic_category"):
             return True
+        if row.type == "user_category":
+            return row.id in self.used_categories
         if row.type == "service":
             return row.id in self.active_services
         if row.type == "runner":
@@ -557,61 +560,15 @@ class LutrisSidebar(Gtk.ListBox):
                 )
                 self.platform_rows[platform] = platform_row
                 insert_row(platform_row)
-        
+
         for category in categories:
             if category["name"] not in self.category_rows:
-                new_category_row = CategorySidebarRow(category)
+                new_category_row = CategorySidebarRow(category, application=self.application)
                 self.category_rows[category["name"]] = new_category_row
                 insert_row(new_category_row)
-        
+
         self.invalidate_filter()
         return True
-
-    def update_categories(self):
-        """update category list in sidebar"""
-        categories_db.remove_unused_categories()
-
-        self.categories = [c for c in categories_db.get_categories() if c['name'] != 'favorite']
-
-        category_names = {category['name'] for category in self.categories}
-
-        # handle now removed categories
-        removed_categories = []
-        for sidebar_category, category_row in self.category_rows.items():
-            if sidebar_category not in category_names:
-                self.remove(category_row)
-                removed_categories.append(sidebar_category)
-        for rem_category in removed_categories:
-            del self.category_rows[rem_category]
-
-        for category in self.categories:
-            category_name = category['name']
-            # handle added category
-            if category_name not in self.category_rows:
-                new_category_row = CategorySidebarRow(category, application=self.application)
-                self.category_rows[category_name] = new_category_row
-
-                # look for proper place to insert new row
-                target_idx = None
-                row_idx = 0
-                cur_row = None
-                while cur_row is not None or row_idx == 0:
-                    cur_row = self.get_row_at_index(row_idx)
-
-                    # encountered category row whose alphabetical order is after row to add, insert here
-                    if isinstance(cur_row, CategorySidebarRow) and cur_row > new_category_row:
-                        target_idx = row_idx
-                        break
-                    # encountered first service row -> end of category list, insert here
-                    if cur_row.type == 'service':
-                        target_idx = row_idx
-                        break
-
-                    row_idx += 1
-
-                self.insert(new_category_row, target_idx)
-
-        self.show_all()
 
     def on_game_start(self, _game):
         """Show the "running" section when a game start"""
