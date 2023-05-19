@@ -68,8 +68,8 @@ class GameActions:
             ("duplicate", _("Duplicate"), self.on_game_duplicate),
             ("configure", _("Configure"), self.on_edit_game_configuration),
             ("favorite", _("Add to favorites"), self.on_add_favorite_game),
-            ("category", _("Categories"), self.on_edit_game_categories),
             ("deletefavorite", _("Remove from favorites"), self.on_delete_favorite_game),
+            ("category", _("Categories"), self.on_edit_game_categories),
             ("execute-script", _("Execute script"), self.on_execute_script_clicked),
             ("browse", _("Browse files"), self.on_browse_files),
             (
