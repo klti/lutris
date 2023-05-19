@@ -9,7 +9,7 @@ from gettext import gettext as _
 import requests
 
 from lutris.util.log import logger
-from lutris.util.ubisoft.consts import CHROME_USERAGENT, CLUB_APPID, UBISOFT_APPID
+from lutris.util.ubisoft.consts import CHROME_USERAGENT, CLUB_APPID
 
 
 def parse_date(date_str):
@@ -105,7 +105,7 @@ class UbisoftConnectClient():
     def _do_options_request(self):
         self._do_request('options', "https://public-ubiservices.ubi.com/v3/profiles/sessions", headers={
             "Origin": "https://connect.ubisoft.com",
-            "Referer": f"https://connect.ubisoft.com/login?appId={UBISOFT_APPID}",
+            "Referer": "https://connect.ubisoft.com/",
             "User-Agent": CHROME_USERAGENT,
         })
 
@@ -218,9 +218,10 @@ class UbisoftConnectClient():
         user_data = {}
         tasty_storage_values = ['userId', 'nameOnPlatform', 'ticket', 'rememberMeTicket', 'sessionId']
         for json_ in storage_jsons:
-            for key in json_:
-                if key in tasty_storage_values:
-                    user_data[key] = json_[key]
+            if json_:  # we do get nulls in this list of json dictionaries sometimes
+                for key in json_:
+                    if key in tasty_storage_values:
+                        user_data[key] = json_[key]
 
         user_data['userId'] = user_data.pop('userId')
         user_data['username'] = user_data.pop('nameOnPlatform')

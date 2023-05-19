@@ -5,7 +5,6 @@ import time
 
 from lutris import settings
 from lutris.database.services import ServiceGameCollection
-from lutris.gui.widgets.utils import get_default_icon, get_pixbuf
 from lutris.util import system
 from lutris.util.http import HTTPError, download_file
 from lutris.util.log import logger
@@ -23,6 +22,7 @@ class ServiceMedia:
     small_size = None
     dest_path = None
     file_pattern = NotImplemented
+    file_format = NotImplemented
     api_field = NotImplemented
     url_pattern = "%s"
 
@@ -33,17 +33,13 @@ class ServiceMedia:
     def get_filename(self, slug):
         return self.file_pattern % slug
 
-    def get_absolute_path(self, slug):
-        """Return the abolute path of a local media"""
+    def get_media_path(self, slug):
+        """Return the absolute path of a local media file"""
         return os.path.join(self.dest_path, self.get_filename(slug))
 
     def exists(self, slug):
         """Whether the icon for the specified slug exists locally"""
-        return system.path_exists(self.get_absolute_path(slug))
-
-    def get_pixbuf_for_game(self, slug, is_installed=True):
-        image_abspath = self.get_absolute_path(slug)
-        return get_pixbuf(image_abspath, self.size, fallback=get_default_icon(self.size), is_installed=is_installed)
+        return system.path_exists(self.get_media_path(slug))
 
     def get_media_url(self, details):
         if self.api_field not in details:
@@ -86,6 +82,20 @@ class ServiceMedia:
             return download_file(url, cache_path, raise_errors=True)
         except HTTPError as ex:
             logger.error("Failed to download %s: %s", url, ex)
+
+    @property
+    def custom_media_storage_size(self):
+        """The size this media is stored in when customized; we accept
+        whatever we get when we download the media, however."""
+        return self.size
+
+    @property
+    def config_ui_size(self):
+        """The size this media should be shown at when in the configuration UI."""
+        return self.size
+
+    def update_desktop(self):
+        """Update the desktop, if this media type appears there. Most don't."""
 
     def render(self):
         """Used if the media requires extra processing"""

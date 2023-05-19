@@ -5,6 +5,7 @@ from functools import lru_cache
 from gettext import gettext as _
 
 from lutris import runtime, settings
+from lutris.exceptions import UnavailableRunnerError
 from lutris.gui.dialogs import DontShowAgainDialog, ErrorDialog
 from lutris.runners.steam import steam
 from lutris.util import linux, system
@@ -35,10 +36,15 @@ def get_playonlinux():
 
 def _iter_proton_locations():
     """Iterate through all existing Proton locations"""
-    for path in [os.path.join(p, "common") for p in steam().get_steamapps_dirs()]:
+    try:
+        steamapp_dirs = steam().get_steamapps_dirs()
+    except:
+        return  # in case of corrupt or unreadable Steam configuration files!
+
+    for path in [os.path.join(p, "common") for p in steamapp_dirs]:
         if os.path.isdir(path):
             yield path
-    for path in [os.path.join(p, "") for p in steam().get_steamapps_dirs()]:
+    for path in [os.path.join(p, "") for p in steamapp_dirs]:
         if os.path.isdir(path):
             yield path
 
@@ -50,6 +56,8 @@ def get_proton_paths():
         proton_versions = [p for p in os.listdir(path) if "Proton" in p]
         for version in proton_versions:
             if system.path_exists(os.path.join(path, version, "dist/bin/wine")):
+                paths.add(path)
+            if system.path_exists(os.path.join(path, version, "files/bin/wine")):
                 paths.add(path)
     return list(paths)
 
@@ -168,8 +176,11 @@ def get_lutris_wine_versions():
     if system.path_exists(WINE_DIR):
         dirs = version_sort(os.listdir(WINE_DIR), reverse=True)
         for dirname in dirs:
-            if is_version_installed(dirname):
-                versions.append(dirname)
+            try:
+                if is_version_installed(dirname):
+                    versions.append(dirname)
+            except UnavailableRunnerError:
+                pass  # if it's not properly installed, skip it
     return versions
 
 
@@ -180,6 +191,10 @@ def get_proton_versions():
         proton_versions = [p for p in os.listdir(proton_path) if "Proton" in p]
         for version in proton_versions:
             path = os.path.join(proton_path, version, "dist/bin/wine")
+            if os.path.isfile(path):
+                versions.append(version)
+            # Support Proton Experimental
+            path = os.path.join(proton_path, version, "files/bin/wine")
             if os.path.isfile(path):
                 versions.append(version)
     return versions
@@ -206,8 +221,7 @@ def get_wine_versions():
     versions = []
     versions += get_system_wine_versions()
     versions += get_lutris_wine_versions()
-    if os.environ.get("LUTRIS_ENABLE_PROTON"):
-        versions += get_proton_versions()
+    versions += get_proton_versions()
     versions += get_pol_wine_versions()
     return versions
 
@@ -216,7 +230,9 @@ def get_wine_version_exe(version):
     if not version:
         version = get_default_version()
     if not version:
-        raise RuntimeError("Wine is not installed")
+        raise UnavailableRunnerError(_("Wine is not installed"))
+    if version in WINE_PATHS:
+        return WINE_PATHS[version]
     return os.path.join(WINE_DIR, "{}/bin/wine".format(version))
 
 

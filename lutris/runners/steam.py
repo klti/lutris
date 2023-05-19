@@ -4,6 +4,7 @@ import subprocess
 from gettext import gettext as _
 
 from lutris.command import MonitoredCommand
+from lutris.exceptions import UnavailableRunnerError
 from lutris.runners import NonInstallableRunnerError
 from lutris.runners.runner import Runner
 from lutris.util import linux, system
@@ -29,6 +30,7 @@ class steam(Runner):
     human_name = _("Steam")
     platforms = [_("Linux")]
     runner_executable = "steam"
+    runner_executable_flatpak = "com.valvesoftware.Steam"
     game_options = [
         {
             "option": "appid",
@@ -161,7 +163,7 @@ class steam(Runner):
         runner_executable = self.runner_config.get("runner_executable")
         if runner_executable and os.path.isfile(runner_executable):
             return runner_executable
-        return system.find_executable(self.runner_executable)
+        return system.find_executable(self.runner_executable) or system.find_executable(self.runner_executable_flatpak)
 
     @property
     def working_dir(self):
@@ -237,12 +239,12 @@ class steam(Runner):
         if steamapps_paths:
             return steamapps_paths[0]
 
-    def install(self, version=None, downloader=None, callback=None):
-        raise NonInstallableRunnerError(
+    def install(self, install_ui_delegate, version=None, callback=None):
+        raise NonInstallableRunnerError(_(
             "Steam for Linux installation is not handled by Lutris.\n"
             "Please go to "
             "<a href='http://steampowered.com'>http://steampowered.com</a>"
-            " or install Steam with the package provided by your distribution."
+            " or install Steam with the package provided by your distribution.")
         )
 
     def install_game(self, appid, generate_acf=False):
@@ -252,7 +254,7 @@ class steam(Runner):
             acf_content = to_vdf(acf_data)
             steamapps_path = self.get_default_steamapps_path()
             if not steamapps_path:
-                raise RuntimeError("Could not find Steam path, is Steam installed?")
+                raise UnavailableRunnerError(_("Could not find Steam path, is Steam installed?"))
             acf_path = os.path.join(steamapps_path, "appmanifest_%s.acf" % appid)
             with open(acf_path, "w", encoding='utf-8') as acf_file:
                 acf_file.write(acf_content)

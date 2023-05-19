@@ -34,6 +34,7 @@ def get_games_where(**conditions):
         Args:
             conditions (dict): named arguments with each field matches its desired value.
             Special values for field names can be used:
+                <field>__lessthan will return rows where `field` is less than the value
                 <field>__isnull will return rows where `field` is NULL if the value is True
                 <field>__not will invert the condition using `!=` instead of `=`
                 <field>__in will match rows for every value of `value`, which should be an iterable
@@ -49,6 +50,9 @@ def get_games_where(**conditions):
         field, *extra_conditions = field.split("__")
         if extra_conditions:
             extra_condition = extra_conditions[0]
+            if extra_condition == "lessthan":
+                condition_fields.append("{} < ?".format(field))
+                condition_values.append(value)
             if extra_condition == "isnull":
                 condition_fields.append("{} is {} null".format(field, "" if value else "not"))
             if extra_condition == "not":
@@ -90,6 +94,9 @@ def get_games_by_ids(game_ids):
 
 
 def get_game_for_service(service, appid):
+    if service == "lutris":
+        return get_game_by_field(appid, field="slug")
+
     existing_games = get_games(filters={"service_id": appid, "service": service})
     if existing_games:
         return existing_games[0]
@@ -158,12 +165,22 @@ def add_or_update(**params):
     will try to match it, otherwise it will try matching
     by slug, creating one when possible.
     """
+    game_id = update_existing(**params)
+    if game_id:
+        return game_id
+
+    return add_game(**params)
+
+
+def update_existing(**params):
+    """Updates a game, but do not add one. If the game exists, this returns its ID;
+    if not it returns None and makes no changes."""
     game_id = get_matching_game(params)
     if game_id:
         params["id"] = game_id
         sql.db_update(settings.PGA_DB, "games", params, {"id": game_id})
         return game_id
-    return add_game(**params)
+    return None
 
 
 def get_matching_game(params):
@@ -229,3 +246,9 @@ def get_unusued_game_name(game_name):
         assigned_name = f"{game_name} {assigned_index}"
 
     return assigned_name
+
+
+def get_game_count(param, value):
+    res = sql.db_select(settings.PGA_DB, "games", fields=("COUNT(id)",), condition=(param, value))
+    if res:
+        return res[0]["COUNT(id)"]

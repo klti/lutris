@@ -54,33 +54,37 @@ class vice(Runner):
         {
             "option": "fullscreen",
             "type": "bool",
+            "section": _("Graphics"),
             "label": _("Fullscreen"),
             "default": False,
         },
         {
             "option": "double",
             "type": "bool",
+            "section": _("Graphics"),
             "label": _("Scale up display by 2"),
             "default": True,
         },
         {
             "option": "aspect_ratio",
             "type": "bool",
+            "section": _("Graphics"),
             "label": _("Preserve aspect ratio"),
             "default": True,
+        },
+        {
+            "option": "renderer",
+            "type": "choice",
+            "section": _("Graphics"),
+            "label": _("Graphics renderer"),
+            "choices": [("OpenGL", "opengl"), (_("Software"), "software")],
+            "default": "opengl",
         },
         {
             "option": "drivesound",
             "type": "bool",
             "label": _("Enable sound emulation of disk drives"),
             "default": False,
-        },
-        {
-            "option": "renderer",
-            "type": "choice",
-            "label": _("Graphics renderer"),
-            "choices": [("OpenGL", "opengl"), (_("Software"), "software")],
-            "default": "opengl",
         },
         {
             "option": "machine",
@@ -116,7 +120,7 @@ class vice(Runner):
             raise ValueError("Invalid machine '%s'" % machine) from ex
         return os.path.join(settings.RUNNER_DIR, "vice/bin/%s" % executable)
 
-    def install(self, version=None, downloader=None, callback=None):
+    def install(self, install_ui_delegate, version=None, callback=None):
 
         def on_runner_installed(*args):
             config_path = system.create_folder("~/.vice")
@@ -130,7 +134,7 @@ class vice(Runner):
             if callback:
                 callback()
 
-        super().install(version, downloader, on_runner_installed)
+        super().install(install_ui_delegate, version, on_runner_installed)
 
     def get_roms_path(self, machine=None):
         if not machine:

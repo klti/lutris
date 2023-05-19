@@ -13,14 +13,15 @@ from lutris.runners.commands.wine import (  # noqa: F401 pylint: disable=unused-
 from lutris.runners.runner import Runner
 from lutris.util import system
 from lutris.util.display import DISPLAY_MANAGER, get_default_dpi
-from lutris.util.graphics.vkquery import is_vulkan_supported
-from lutris.util.jobs import thread_safe_call
+from lutris.util.graphics import vkquery
 from lutris.util.log import logger
+from lutris.util.steam.config import get_steam_dir
 from lutris.util.strings import parse_version, split_arguments
 from lutris.util.wine.d3d_extras import D3DExtrasManager
 from lutris.util.wine.dgvoodoo2 import dgvoodoo2Manager
-from lutris.util.wine.dxvk import DXVKManager
+from lutris.util.wine.dxvk import REQUIRED_VULKAN_API_VERSION, DXVKManager
 from lutris.util.wine.dxvk_nvapi import DXVKNVAPIManager
+from lutris.util.wine.extract_icon import PEFILE_AVAILABLE, ExtractIcon
 from lutris.util.wine.prefix import DEFAULT_DLL_OVERRIDES, WinePrefixManager, find_prefix
 from lutris.util.wine.vkd3d import VKD3DManager
 from lutris.util.wine.wine import (
@@ -32,6 +33,115 @@ from lutris.util.wine.wine import (
 
 DEFAULT_WINE_PREFIX = "~/.wine"
 MIN_SAFE_VERSION = "7.0"  # Wine installers must run with at least this version
+
+
+def _get_prefix_warning(config):
+    if config.get("prefix"):
+        return None
+
+    exe = config.get("exe")
+    if exe and find_prefix(exe):
+        return None
+
+    return _("Some Wine configuration options cannot be applied, if no prefix can be found.")
+
+
+def _get_dxvk_warning(config):
+    if config.get("dxvk") and not vkquery.is_vulkan_supported():
+        return _("Vulkan is not installed or is not supported by your system")
+
+    return None
+
+
+def _get_dxvk_version_warning(config):
+    if config.get("dxvk") and vkquery.is_vulkan_supported():
+        version = config.get("dxvk_version")
+        if version and not version.startswith("v1."):
+            required_api_version = REQUIRED_VULKAN_API_VERSION
+            library_api_version = vkquery.get_vulkan_api_version()
+            if library_api_version and library_api_version < required_api_version:
+                return _("<b>Warning</b> Lutris has detected that Vulkan API version %s is installed, "
+                         "but to use the latest DXVK version, %s is required."
+                         ) % (
+                    vkquery.format_version(library_api_version),
+                    vkquery.format_version(required_api_version)
+                )
+
+            devices = vkquery.get_device_info()
+
+            if devices and devices[0].api_version < required_api_version:
+                return _(
+                    "<b>Warning</b> Lutris has detected that the best device available ('%s') supports Vulkan API %s, "
+                    "but to use the latest DXVK version, %s is required."
+                ) % (
+                    devices[0].name,
+                    vkquery.format_version(devices[0].api_version),
+                    vkquery.format_version(required_api_version)
+                )
+
+    return None
+
+
+def _get_vkd3d_warning(config):
+    if config.get("vkd3d"):
+        if not vkquery.is_vulkan_supported():
+            return _("<b>Warning</b> Vulkan is not installed or is not supported by your system")
+
+    return None
+
+
+def _get_path_for_version(config, version=None):
+    """Return the absolute path of a wine executable for a given version,
+    or the configured version if you don't ask for a version."""
+    if not version:
+        version = config["version"]
+
+    if version in WINE_PATHS:
+        return system.find_executable(WINE_PATHS[version])
+    if "Proton" in version:
+        for proton_path in get_proton_paths():
+            if os.path.isfile(os.path.join(proton_path, version, "dist/bin/wine")):
+                return os.path.join(proton_path, version, "dist/bin/wine")
+            if os.path.isfile(os.path.join(proton_path, version, "files/bin/wine")):
+                return os.path.join(proton_path, version, "files/bin/wine")
+    if version.startswith("PlayOnLinux"):
+        version, arch = version.split()[1].rsplit("-", 1)
+        return os.path.join(POL_PATH, "wine", "linux-" + arch, version, "bin/wine")
+    if version == "custom":
+        return config.get("custom_wine_path", "")
+    return os.path.join(WINE_DIR, version, "bin/wine")
+
+
+def _get_esync_warning(config):
+    if config.get("esync"):
+        limits_set = is_esync_limit_set()
+        wine_path = _get_path_for_version(config)
+        wine_ver = is_version_esync(wine_path)
+
+        if not wine_ver:
+            return _("<b>Warning</b> The Wine build you have selected does not support Esync")
+
+        if not limits_set:
+            return _("<b>Warning</b> Your limits are not set correctly. Please increase them as described here:\n"
+                     "<a href='https://github.com/lutris/docs/blob/master/HowToEsync.md'>"
+                     "How-to-Esync (https://github.com/lutris/docs/blob/master/HowToEsync.md)</a>")
+
+    return None
+
+
+def _get_fsync_warning(config):
+    if config.get("fsync"):
+        fsync_supported = is_fsync_supported()
+        wine_path = _get_path_for_version(config)
+        wine_ver = is_version_fsync(wine_path)
+
+        if not wine_ver:
+            return _("<b>Warning</b> The Wine build you have selected does not support Fsync.")
+
+        if not fsync_supported:
+            return _("<b>Warning</b> Your kernel is not patched for fsync.")
+
+        return None
 
 
 class wine(Runner):
@@ -69,6 +179,7 @@ class wine(Runner):
             "option": "prefix",
             "type": "directory_chooser",
             "label": _("Wine prefix"),
+            "warning": _get_prefix_warning,
             "help": _(
                 'The prefix used by Wine.\n'
                 "It's a directory containing a set of files and "
@@ -104,8 +215,11 @@ class wine(Runner):
         "wineboot.exe",
     )
 
-    def __init__(self, config=None):  # noqa: C901
+    def __init__(self, config=None, prefix=None, working_dir=None, wine_arch=None):  # noqa: C901
         super().__init__(config)
+        self._prefix = prefix
+        self._working_dir = working_dir
+        self._wine_arch = wine_arch
         self.dll_overrides = DEFAULT_DLL_OVERRIDES.copy()  # we'll modify this, so we better copy it
 
         def get_wine_version_choices():
@@ -125,43 +239,6 @@ class wine(Runner):
                     label = version
                 version_choices.append((label, version))
             return version_choices
-
-        def esync_limit_callback(widget, option, config):
-            limits_set = is_esync_limit_set()
-            wine_path = self.get_path_for_version(config["version"])
-            wine_ver = is_version_esync(wine_path)
-            response = True
-
-            if not wine_ver:
-                response = thread_safe_call(esync_display_version_warning)
-
-            if not limits_set:
-                thread_safe_call(esync_display_limit_warning)
-                response = False
-
-            return widget, option, response
-
-        def fsync_support_callback(widget, option, config):
-            fsync_supported = is_fsync_supported()
-            wine_path = self.get_path_for_version(config["version"])
-            wine_ver = is_version_fsync(wine_path)
-            response = True
-
-            if not wine_ver:
-                response = thread_safe_call(fsync_display_version_warning)
-
-            if not fsync_supported:
-                thread_safe_call(fsync_display_support_warning)
-                response = False
-
-            return widget, option, response
-
-        def dxvk_vulkan_callback(widget, option, config):
-            response = True
-            if not is_vulkan_supported():
-                if not thread_safe_call(display_vulkan_error):
-                    response = False
-            return widget, option, response
 
         self.runner_options = [
             {
@@ -194,11 +271,11 @@ class wine(Runner):
             },
             {
                 "option": "dxvk",
+                "section": _("Graphics"),
                 "label": _("Enable DXVK"),
-                "type": "extended_bool",
-                "callback": dxvk_vulkan_callback,
-                "callback_on": True,
+                "type": "bool",
                 "default": True,
+                "warning": _get_dxvk_warning,
                 "active": True,
                 "help": _(
                     "Use DXVK to "
@@ -207,19 +284,21 @@ class wine(Runner):
             },
             {
                 "option": "dxvk_version",
+                "section": _("Graphics"),
                 "label": _("DXVK version"),
                 "advanced": True,
                 "type": "choice_with_entry",
                 "choices": DXVKManager().version_choices,
                 "default": DXVKManager().version,
+                "warning": _get_dxvk_version_warning
             },
 
             {
                 "option": "vkd3d",
+                "section": _("Graphics"),
                 "label": _("Enable VKD3D"),
-                "type": "extended_bool",
-                "callback": dxvk_vulkan_callback,
-                "callback_on": True,
+                "type": "bool",
+                "warning": _get_vkd3d_warning,
                 "default": True,
                 "active": True,
                 "help": _(
@@ -228,6 +307,7 @@ class wine(Runner):
             },
             {
                 "option": "vkd3d_version",
+                "section": _("Graphics"),
                 "label": _("VKD3D version"),
                 "advanced": True,
                 "type": "choice_with_entry",
@@ -236,6 +316,7 @@ class wine(Runner):
             },
             {
                 "option": "d3d_extras",
+                "section": _("Graphics"),
                 "label": _("Enable D3D Extras"),
                 "type": "bool",
                 "default": True,
@@ -247,6 +328,7 @@ class wine(Runner):
             },
             {
                 "option": "d3d_extras_version",
+                "section": _("Graphics"),
                 "label": _("D3D Extras version"),
                 "advanced": True,
                 "type": "choice_with_entry",
@@ -255,6 +337,7 @@ class wine(Runner):
             },
             {
                 "option": "dxvk_nvapi",
+                "section": _("Graphics"),
                 "label": _("Enable DXVK-NVAPI / DLSS"),
                 "type": "bool",
                 "default": True,
@@ -265,6 +348,7 @@ class wine(Runner):
             },
             {
                 "option": "dxvk_nvapi_version",
+                "section": _("Graphics"),
                 "label": _("DXVK NVAPI version"),
                 "advanced": True,
                 "type": "choice_with_entry",
@@ -273,6 +357,7 @@ class wine(Runner):
             },
             {
                 "option": "dgvoodoo2",
+                "section": _("Graphics"),
                 "label": _("Enable dgvoodoo2"),
                 "type": "bool",
                 "default": False,
@@ -285,6 +370,7 @@ class wine(Runner):
             },
             {
                 "option": "dgvoodoo2_version",
+                "section": _("Graphics"),
                 "label": _("dgvoodoo2 version"),
                 "advanced": True,
                 "type": "choice_with_entry",
@@ -294,9 +380,8 @@ class wine(Runner):
             {
                 "option": "esync",
                 "label": _("Enable Esync"),
-                "type": "extended_bool",
-                "callback": esync_limit_callback,
-                "callback_on": True,
+                "type": "bool",
+                "warning": _get_esync_warning,
                 "active": True,
                 "default": True,
                 "help": _(
@@ -308,10 +393,9 @@ class wine(Runner):
             {
                 "option": "fsync",
                 "label": _("Enable Fsync"),
-                "type": "extended_bool",
+                "type": "bool",
                 "default": is_fsync_supported(),
-                "callback": fsync_support_callback,
-                "callback_on": True,
+                "warning": _get_fsync_warning,
                 "active": True,
                 "help": _(
                     "Enable futex-based synchronization (fsync). "
@@ -353,6 +437,7 @@ class wine(Runner):
             },
             {
                 "option": "Desktop",
+                "section": _("Virtual Desktop"),
                 "label": _("Windowed (virtual desktop)"),
                 "type": "bool",
                 "default": False,
@@ -364,6 +449,7 @@ class wine(Runner):
             },
             {
                 "option": "WineDesktop",
+                "section": _("Virtual Desktop"),
                 "label": _("Virtual desktop resolution"),
                 "type": "choice_with_entry",
                 "choices": DISPLAY_MANAGER.get_resolutions,
@@ -371,6 +457,7 @@ class wine(Runner):
             },
             {
                 "option": "Dpi",
+                "section": _("DPI"),
                 "label": _("Enable DPI Scaling"),
                 "type": "bool",
                 "default": False,
@@ -381,6 +468,7 @@ class wine(Runner):
             },
             {
                 "option": "ExplicitDpi",
+                "section": _("DPI"),
                 "label": _("DPI"),
                 "type": "string",
                 "help": _(
@@ -460,24 +548,26 @@ class wine(Runner):
                 "advanced": True,
                 "default": False,
                 "help":
-                _("Automatically disables one of Wine's detected joypad "
-                  "to avoid having 2 controllers detected"),
+                    _("Automatically disables one of Wine's detected joypad "
+                      "to avoid having 2 controllers detected"),
             },
             {
                 "option": "sandbox",
                 "type": "bool",
+                "section": _("Sandbox"),
                 "label": _("Create a sandbox for Wine folders"),
                 "default": True,
                 "advanced": True,
                 "help": _(
                     "Do not use $HOME for desktop integration folders.\n"
-                    "By default, it use the directories in the confined "
+                    "By default, it will use the directories in the confined "
                     "Windows environment."
                 ),
             },
             {
                 "option": "sandbox_dir",
                 "type": "directory_chooser",
+                "section": _("Sandbox"),
                 "label": _("Sandbox directory"),
                 "help": _("Custom directory for desktop integration folders."),
                 "advanced": True,
@@ -499,15 +589,26 @@ class wine(Runner):
 
     @property
     def prefix_path(self):
-        """Return the absolute path of the Wine prefix"""
-        _prefix_path = self.game_config.get("prefix") \
-            or os.environ.get("WINEPREFIX")
+        """Return the absolute path of the Wine prefix. Falls back to default WINE prefix."""
+        _prefix_path = self._get_raw_prefix_path()
+        if not _prefix_path:
+            logger.warning("No WINE prefix provided, falling back to system default WINE prefix.")
+            _prefix_path = DEFAULT_WINE_PREFIX
+        return os.path.expanduser(_prefix_path)
+
+    @property
+    def prefix_path_if_provided(self):
+        """Return the absolute path of the Wine prefix, if known. None if not."""
+        _prefix_path = self._get_raw_prefix_path()
+        if _prefix_path:
+            return os.path.expanduser(_prefix_path)
+
+    def _get_raw_prefix_path(self):
+        _prefix_path = self._prefix or self.game_config.get("prefix") or os.environ.get("WINEPREFIX")
         if not _prefix_path and self.game_config.get("exe"):
             # Find prefix from game if we have one
             _prefix_path = find_prefix(self.game_exe)
-        if not _prefix_path:
-            _prefix_path = DEFAULT_WINE_PREFIX
-        return os.path.expanduser(_prefix_path)
+        return _prefix_path
 
     @property
     def game_exe(self):
@@ -527,9 +628,9 @@ class wine(Runner):
     @property
     def working_dir(self):
         """Return the working directory to use when running the game."""
-        option = self.game_config.get("working_dir")
-        if option:
-            return option
+        _working_dir = self._working_dir or self.game_config.get("working_dir")
+        if _working_dir:
+            return _working_dir
         if self.game_exe:
             game_dir = os.path.dirname(self.game_exe)
             if os.path.isdir(game_dir):
@@ -546,10 +647,19 @@ class wine(Runner):
         """Return the wine architecture.
 
         Get it from the config or detect it from the prefix"""
-        arch = self.game_config.get("arch") or "auto"
+        arch = self._wine_arch or self.game_config.get("arch") or "auto"
         if arch not in ("win32", "win64"):
             arch = detect_arch(self.prefix_path, self.get_executable())
         return arch
+
+    def get_runner_version(self, version=None, lutris_only=False):
+        if not version:
+            version = self.get_version()
+
+        if version and not lutris_only and version in WINE_PATHS:
+            return {"version": version}
+
+        return super().get_runner_version(version)
 
     def get_version(self, use_default=True):
         """Return the Wine version to use. use_default can be set to false to
@@ -562,18 +672,25 @@ class wine(Runner):
 
     def get_path_for_version(self, version):
         """Return the absolute path of a wine executable for a given version"""
-        if version in WINE_PATHS:
-            return system.find_executable(WINE_PATHS[version])
-        if "Proton" in version:
-            for proton_path in get_proton_paths():
-                if os.path.isfile(os.path.join(proton_path, version, "dist/bin/wine")):
-                    return os.path.join(proton_path, version, "dist/bin/wine")
-        if version.startswith("PlayOnLinux"):
-            version, arch = version.split()[1].rsplit("-", 1)
-            return os.path.join(POL_PATH, "wine", "linux-" + arch, version, "bin/wine")
-        if version == "custom":
-            return self.runner_config.get("custom_wine_path", "")
-        return os.path.join(WINE_DIR, version, "bin/wine")
+        return _get_path_for_version(self.runner_config, version)
+
+    def resolve_config_path(self, path, relative_to=None):
+        # Resolve paths with tolerance for Windows-isms;
+        # first try to fix mismatched casing, and then if that
+        # finds no file or directory, try again after swapping in
+        # slashes for backslashes.
+
+        resolved = super().resolve_config_path(path, relative_to)
+        resolved = system.fix_path_case(resolved)
+
+        if not os.path.exists(resolved) and '\\' in path:
+            fixed = path.replace('\\', '/')
+            fixed_resolved = super().resolve_config_path(fixed, relative_to)
+            fixed_resolved = system.fix_path_case(fixed_resolved)
+            if fixed_resolved:
+                return fixed_resolved
+
+        return resolved
 
     def get_executable(self, version=None, fallback=True):
         """Return the path to the Wine executable.
@@ -687,11 +804,13 @@ class wine(Runner):
 
     def run_wine_terminal(self, *args):
         terminal = self.system_config.get("terminal_app")
+        system_winetricks = self.runner_config.get("system_winetricks")
         open_wine_terminal(
             terminal=terminal,
             wine_path=self.get_executable(),
             prefix=self.prefix_path,
-            env=self.get_env(os_env=True)
+            env=self.get_env(os_env=True),
+            system_winetricks=system_winetricks,
         )
 
     def run_winetricks(self, *args):
@@ -732,35 +851,37 @@ class wine(Runner):
 
     def set_regedit_keys(self):
         """Reset regedit keys according to config."""
-        prefix_manager = WinePrefixManager(self.prefix_path)
-        # Those options are directly changed with the prefix manager and skip
-        # any calls to regedit.
-        managed_keys = {
-            "ShowCrashDialog": prefix_manager.set_crash_dialogs,
-            "Desktop": prefix_manager.set_virtual_desktop,
-            "WineDesktop": prefix_manager.set_desktop_size,
-        }
+        prefix = self.prefix_path_if_provided
+        if prefix:
+            prefix_manager = WinePrefixManager(prefix)
+            # Those options are directly changed with the prefix manager and skip
+            # any calls to regedit.
+            managed_keys = {
+                "ShowCrashDialog": prefix_manager.set_crash_dialogs,
+                "Desktop": prefix_manager.set_virtual_desktop,
+                "WineDesktop": prefix_manager.set_desktop_size,
+            }
 
-        for key, path in self.reg_keys.items():
-            value = self.runner_config.get(key) or "auto"
-            if not value or value == "auto" and key not in managed_keys:
-                prefix_manager.clear_registry_subkeys(path, key)
-            elif key in self.runner_config:
-                if key in managed_keys:
-                    # Do not pass fallback 'auto' value to managed keys
-                    if value == "auto":
-                        value = None
-                    managed_keys[key](value)
-                    continue
-                # Convert numeric strings to integers so they are saved as dword
-                if value.isdigit():
-                    value = int(value)
+            for key, path in self.reg_keys.items():
+                value = self.runner_config.get(key) or "auto"
+                if not value or value == "auto" and key not in managed_keys:
+                    prefix_manager.clear_registry_subkeys(path, key)
+                elif key in self.runner_config:
+                    if key in managed_keys:
+                        # Do not pass fallback 'auto' value to managed keys
+                        if value == "auto":
+                            value = None
+                        managed_keys[key](value)
+                        continue
+                    # Convert numeric strings to integers so they are saved as dword
+                    if value.isdigit():
+                        value = int(value)
 
-                prefix_manager.set_registry_key(path, key, value)
+                    prefix_manager.set_registry_key(path, key, value)
 
-        # We always configure the DPI, because if the user turns off DPI scaling, but it
-        # had been on the only way to implement that is to save 96 DPI into the registry.
-        prefix_manager.set_dpi(self.get_dpi())
+            # We always configure the DPI, because if the user turns off DPI scaling, but it
+            # had been on the only way to implement that is to save 96 DPI into the registry.
+            prefix_manager.set_dpi(self.get_dpi())
 
     def get_dpi(self):
         """Return the DPI to be used by Wine; returns None to allow Wine's own
@@ -769,72 +890,60 @@ class wine(Runner):
             explicit_dpi = self.runner_config.get("ExplicitDpi")
             if explicit_dpi == "auto":
                 explicit_dpi = None
-            try:
-                explicit_dpi = int(explicit_dpi)
-            except:
-                explicit_dpi = None
+            else:
+                try:
+                    explicit_dpi = int(explicit_dpi)
+                except:
+                    explicit_dpi = None
             return explicit_dpi or get_default_dpi()
 
         return None
-
-    def setup_dlls(self, manager_class, enable, version):
-        """Enable or disable DLLs"""
-        dll_manager = manager_class(
-            self.prefix_path,
-            arch=self.wine_arch,
-            version=version,
-        )
-
-        # manual version only sets the dlls to native
-        manager_version = dll_manager.version
-        if not manager_version or manager_version.lower() != "manual":
-            if enable:
-                dll_manager.enable()
-            else:
-                dll_manager.disable()
-
-        if enable:
-            for dll in dll_manager.managed_dlls:
-                # We have to make sure that the dll exists before setting it to native
-                if dll_manager.dll_exists(dll):
-                    self.dll_overrides[dll] = "n"
 
     def prelaunch(self):
         if not system.path_exists(os.path.join(self.prefix_path, "user.reg")):
             logger.warning("No valid prefix detected in %s, creating one...", self.prefix_path)
             create_prefix(self.prefix_path, wine_path=self.get_executable(), arch=self.wine_arch, runner=self)
 
-        prefix_manager = WinePrefixManager(self.prefix_path)
-        if self.runner_config.get("autoconf_joypad", False):
-            prefix_manager.configure_joypads()
-        self.sandbox(prefix_manager)
-        self.set_regedit_keys()
+        prefix = self.prefix_path_if_provided
+        if prefix:
+            prefix_manager = WinePrefixManager(prefix)
+            if self.runner_config.get("autoconf_joypad", False):
+                prefix_manager.configure_joypads()
+            prefix_manager.create_user_symlinks()
+            self.sandbox(prefix_manager)
+            self.set_regedit_keys()
 
-        self.setup_dlls(
-            DXVKManager,
-            bool(self.runner_config.get("dxvk")),
-            self.runner_config.get("dxvk_version")
-        )
-        self.setup_dlls(
-            VKD3DManager,
-            bool(self.runner_config.get("vkd3d")),
-            self.runner_config.get("vkd3d_version")
-        )
-        self.setup_dlls(
-            DXVKNVAPIManager,
-            bool(self.runner_config.get("dxvk_nvapi")),
-            self.runner_config.get("dxvk_nvapi_version")
-        )
-        self.setup_dlls(
-            D3DExtrasManager,
-            bool(self.runner_config.get("d3d_extras")),
-            self.runner_config.get("d3d_extras_version")
-        )
-        self.setup_dlls(
-            dgvoodoo2Manager,
-            bool(self.runner_config.get("dgvoodoo2")),
-            self.runner_config.get("dgvoodoo2_version")
-        )
+            for manager, enabled in self.get_dll_managers().items():
+                manager.setup(enabled)
+
+    def get_dll_managers(self, enabled_only=False):
+        """Returns the DLL managers in a dict; the keys are the managers themselves,
+        and the values are the enabled flags for them. If 'enabled_only' is true,
+        only enabled managers are returned, so disabled managers are not created."""
+        manager_classes = [
+            (DXVKManager, "dxvk", "dxvk_version"),
+            (VKD3DManager, "vkd3d", "vkd3d_version"),
+            (DXVKNVAPIManager, "dxvk_nvapi", "dxvk_nvapi_version"),
+            (D3DExtrasManager, "d3d_extras", "d3d_extras_version"),
+            (dgvoodoo2Manager, "dgvoodoo2", "dgvoodoo2_version")
+        ]
+
+        managers = {}
+        prefix = self.prefix_path_if_provided
+
+        if prefix:
+            for manager_class, enabled_option, version_option in manager_classes:
+                enabled = bool(self.runner_config.get(enabled_option))
+                version = self.runner_config.get(version_option)
+                if enabled or not enabled_only:
+                    manager = manager_class(
+                        prefix,
+                        arch=self.wine_arch,
+                        version=version
+                    )
+                    managers[manager] = enabled
+
+        return managers
 
     def get_dll_overrides(self):
         """Return the DLLs overriden at runtime"""
@@ -889,10 +998,25 @@ class wine(Runner):
         if self.runner_config.get("eac"):
             env["PROTON_EAC_RUNTIME"] = os.path.join(settings.RUNTIME_DIR, "eac_runtime")
 
+        for dll_manager in self.get_dll_managers(enabled_only=True):
+            self.dll_overrides.update(dll_manager.get_enabling_dll_overrides())
+
         overrides = self.get_dll_overrides()
         if overrides:
             self.dll_overrides.update(overrides)
+
         env["WINEDLLOVERRIDES"] = get_overrides_env(self.dll_overrides)
+
+        # Proton support
+        if "Proton" in self.get_version():
+            steam_dir = get_steam_dir()
+            if steam_dir:  # May be None for example if Proton-GE is used but Steam is not installed
+                env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = steam_dir
+            env["STEAM_COMPAT_DATA_PATH"] = self.prefix_path
+            env["STEAM_COMPAT_APP_ID"] = '0'
+            env["SteamAppId"] = '0'
+            if "SteamGameId" not in env:
+                env["SteamGameId"] = "lutris-game"
         return env
 
     def get_runtime_env(self):
@@ -930,9 +1054,9 @@ class wine(Runner):
 
     def sandbox(self, wine_prefix):
         if self.runner_config.get("sandbox", True):
-            wine_prefix.desktop_integration(desktop_dir=self.runner_config.get("sandbox_dir"))
+            wine_prefix.enable_desktop_integration_sandbox(desktop_dir=self.runner_config.get("sandbox_dir"))
         else:
-            wine_prefix.desktop_integration(restore=True)
+            wine_prefix.restore_desktop_integration()
 
     def play(self):  # pylint: disable=too-many-return-statements # noqa: C901
         game_exe = self.game_exe
@@ -943,7 +1067,7 @@ class wine(Runner):
         if using_dxvk:
             # Set this to 1 to enable access to more RAM for 32bit applications
             launch_info["env"]["WINE_LARGE_ADDRESS_AWARE"] = "1"
-            if not is_vulkan_supported():
+            if not vkquery.is_vulkan_supported():
                 if not display_vulkan_error(on_launch=True):
                     return {"error": "VULKAN_NOT_FOUND"}
 
@@ -1017,3 +1141,36 @@ class wine(Runner):
 
         # Relative path
         return path
+
+    def extract_icon(self, game_slug):
+        """Extracts the 128*128 icon from EXE and saves it, if not resizes the biggest icon found.
+        returns true if an icon is saved, false if not"""
+        try:
+            wantedsize = (128, 128)
+            pathtoicon = settings.ICON_PATH + "/lutris_" + game_slug + ".png"
+            if not self.game_exe or os.path.exists(pathtoicon) or not PEFILE_AVAILABLE:
+                return False
+
+            extractor = ExtractIcon(self.game_exe)
+            groups = extractor.get_group_icons()
+
+            icons = []
+            biggestsize = (0, 0)
+            biggesticon = -1
+            for i in range(len(groups[0])):
+                icons.append(extractor.export(groups[0], i))
+                if icons[i].size > biggestsize:
+                    biggesticon = i
+                    biggestsize = icons[i].size
+                elif icons[i].size == wantedsize:
+                    icons[i].save(pathtoicon)
+                    return True
+
+            if biggesticon >= 0:
+                resized = icons[biggesticon].resize(wantedsize)
+                resized.save(pathtoicon)
+                return True
+        except Exception as err:
+            logger.exception("Failed to extract exe icon: %s", err)
+
+        return False

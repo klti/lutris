@@ -13,12 +13,14 @@ from lutris.database.games import add_game, get_game_by_field, get_games
 from lutris.database.services import ServiceGameCollection
 from lutris.game import Game
 from lutris.gui.dialogs import NoticeDialog
-from lutris.gui.dialogs.webconnect_dialog import WebConnectDialog
+from lutris.gui.dialogs.webconnect_dialog import DEFAULT_USER_AGENT, WebConnectDialog
 from lutris.gui.views.media_loader import download_media
+from lutris.gui.widgets.utils import BANNER_SIZE, ICON_SIZE
 from lutris.installer import get_installers
 from lutris.services.service_media import ServiceMedia
 from lutris.util import system
 from lutris.util.cookies import WebkitCookieJar
+from lutris.util.jobs import AsyncCall
 from lutris.util.log import logger
 
 PGA_DB = settings.PGA_DB
@@ -30,25 +32,39 @@ class AuthTokenExpired(Exception):
 
 class LutrisBanner(ServiceMedia):
     service = 'lutris'
-    size = (184, 69)
+    size = BANNER_SIZE
     dest_path = settings.BANNER_PATH
     file_pattern = "%s.jpg"
+    file_format = "jpeg"
     api_field = 'banner_url'
 
 
 class LutrisIcon(LutrisBanner):
-    size = (32, 32)
+    size = ICON_SIZE
     dest_path = settings.ICON_PATH
     file_pattern = "lutris_%s.png"
+    file_format = "png"
     api_field = 'icon_url'
+
+    @property
+    def custom_media_storage_size(self):
+        return (128, 128)
+
+    def update_desktop(self):
+        system.update_desktop_icons()
 
 
 class LutrisCoverart(ServiceMedia):
     service = 'lutris'
     size = (264, 352)
     file_pattern = "%s.jpg"
+    file_format = "jpeg"
     dest_path = settings.COVERART_PATH
     api_field = 'coverart'
+
+    @property
+    def config_ui_size(self):
+        return (66, 88)
 
 
 class LutrisCoverartMedium(LutrisCoverart):
@@ -70,6 +86,7 @@ class BaseService(GObject.Object):
     medias = {}
     extra_medias = {}
     default_format = "icon"
+    is_loading = False
 
     __gsignals__ = {
         "service-games-load": (GObject.SIGNAL_RUN_FIRST, None, ()),
@@ -108,16 +125,31 @@ class BaseService(GObject.Object):
             return False
         return launcher.is_installed
 
-    def reload(self):
-        """Refresh the service's games"""
-        self.emit("service-games-load")
-        try:
-            self.wipe_game_cache()
-            self.load()
-            self.load_icons()
-            self.add_installed_games()
-        finally:
+    def start_reload(self, reloaded_callback):
+        """Refresh the service's games, asynchronously. This raises signals, but
+        does so on the main thread- and runs the reload on a worker thread. It calls
+        reloaded_callback when done, passing any error (or None on success)"""
+        def do_reload():
+            if self.is_loading:
+                logger.warning("'%s' games are already loading", self.name)
+                return
+
+            try:
+                self.is_loading = True
+
+                self.wipe_game_cache()
+                self.load()
+                self.load_icons()
+                self.add_installed_games()
+            finally:
+                self.is_loading = False
+
+        def reload_cb(_result, error):
             self.emit("service-games-loaded")
+            reloaded_callback(error)
+
+        self.emit("service-games-load")
+        AsyncCall(do_reload, reload_cb)
 
     def load(self):
         logger.warning("Load method not implemented")
@@ -126,15 +158,16 @@ class BaseService(GObject.Object):
         """Download all game media from the service"""
         all_medias = self.medias.copy()
         all_medias.update(self.extra_medias)
+
+        service_medias = [media_type() for media_type in all_medias.values()]
+
         # Download icons
-        for icon_type in all_medias:
-            service_media = all_medias[icon_type]()
+        for service_media in service_medias:
             media_urls = service_media.get_media_urls()
             download_media(media_urls, service_media)
 
         # Process icons
-        for icon_type in all_medias:
-            service_media = all_medias[icon_type]()
+        for service_media in service_medias:
             service_media.render()
 
     def wipe_game_cache(self):
@@ -281,11 +314,19 @@ class BaseService(GObject.Object):
     def add_installed_games(self):
         """Services can implement this method to scan for locally
         installed games and add them to lutris.
+
+        This runs on a worker thread, and must trigger UI actions -
+        so no emitting signals here.
         """
 
     def get_game_directory(self, _installer):
         """Specific services should implement this"""
         return ""
+
+    def get_game_platforms(self, db_game):
+        """Interprets the database record for this game from this service
+        to extract its platform, or returns None if this is not available."""
+        return None
 
 
 class OnlineService(BaseService):
@@ -298,6 +339,7 @@ class OnlineService(BaseService):
 
     login_window_width = 390
     login_window_height = 500
+    login_user_agent = DEFAULT_USER_AGENT
 
     @property
     def credential_files(self):
@@ -315,8 +357,7 @@ class OnlineService(BaseService):
             return
         logger.debug("Connecting to %s", self.name)
         dialog = WebConnectDialog(self, parent)
-        dialog.set_modal(True)
-        dialog.show()
+        dialog.run()
 
     def is_authenticated(self):
         """Return whether the service is authenticated"""

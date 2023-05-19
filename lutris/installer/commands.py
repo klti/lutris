@@ -14,6 +14,7 @@ from lutris import runtime
 from lutris.cache import get_cache_path
 from lutris.command import MonitoredCommand
 from lutris.database.games import get_game_by_field
+from lutris.exceptions import UnavailableRunnerError, watch_errors
 from lutris.game import Game
 from lutris.installer.errors import ScriptingError
 from lutris.runners import import_task
@@ -167,7 +168,7 @@ class CommandsMixin:
         )
         command.accepted_return_code = return_code
         command.start()
-        GLib.idle_add(self.parent.attach_logger, command)
+        self.interpreter_ui_delegate.attach_log(command)
         self.heartbeat = GLib.timeout_add(1000, self._monitor_task, command)
         return "STOP"
 
@@ -191,7 +192,7 @@ class CommandsMixin:
         for filename in filenames:
             msg = _("Extracting %s") % os.path.basename(filename)
             logger.debug(msg)
-            GLib.idle_add(self.parent.set_status, msg)
+            self.interpreter_ui_delegate.report_status(msg)
             merge_single = "nomerge" not in data
             extractor = data.get("format")
             logger.debug("extracting file %s to %s", filename, dest_path)
@@ -203,27 +204,18 @@ class CommandsMixin:
         self._check_required_params("options", data, "input_menu")
         identifier = data.get("id")
         alias = "INPUT_%s" % identifier if identifier else None
-        has_entry = data.get("entry")
         options = data["options"]
         preselect = self._substitute(data.get("preselect", ""))
-        GLib.idle_add(
-            self.parent.input_menu,
-            alias,
-            options,
-            preselect,
-            has_entry,
-            self._on_input_menu_validated,
-        )
+        self.interpreter_ui_delegate.begin_input_menu(alias, options, preselect, self._on_input_menu_validated)
         return "STOP"
 
-    def _on_input_menu_validated(self, _widget, *args):
-        alias = args[0]
-        menu = args[1]
+    def _on_input_menu_validated(self, alias, menu):
         choosen_option = menu.get_active_id()
         if choosen_option:
             self.user_inputs.append({"alias": alias, "value": choosen_option})
-            GLib.idle_add(self.parent.continue_button.hide)
             self._iter_commands()
+        else:
+            raise RuntimeError("A required input option was not selected, so the installation can't continue.")
 
     def insert_disc(self, data):
         """Request user to insert an optical disc"""
@@ -239,9 +231,8 @@ class CommandsMixin:
               "containing the following file or folder:\n"
               "<i>%s</i>") % requires
         )
-        if self.installer.runner == "wine":
-            GLib.idle_add(self.parent.eject_button.show)
-        GLib.idle_add(self.parent.ask_for_disc, message, self._find_matching_disc, requires)
+        self.interpreter_ui_delegate.begin_disc_prompt(message, requires, self.installer,
+                                                       self._find_matching_disc)
         return "STOP"
 
     def _find_matching_disc(self, _widget, requires, extra_path=None):
@@ -256,7 +247,9 @@ class CommandsMixin:
                 logger.debug("Found %s on cdrom %s", requires, drive)
                 self.game_disc = drive
                 self._iter_commands()
-                break
+                return
+
+        raise RuntimeError(_("The required file '%s' could not be located.") % requires)
 
     def mkdir(self, directory):
         """Create directory"""
@@ -387,8 +380,12 @@ class CommandsMixin:
         return runner_name, task_name
 
     def get_wine_path(self):
-        """Return absolute path of wine version used during the install"""
-        return get_wine_version_exe(self._get_runner_version())
+        """Return absolute path of wine version used during the install, but
+        None if the wine exe can't be located."""
+        try:
+            return get_wine_version_exe(self._get_runner_version())
+        except UnavailableRunnerError:
+            return None
 
     def task(self, data):
         """Directive triggering another function specific to a runner.
@@ -397,8 +394,6 @@ class CommandsMixin:
         passed to the runner task.
         """
         self._check_required_params("name", data, "task")
-        if self.parent:
-            GLib.idle_add(self.parent.cancel_button.set_sensitive, False)
         runner_name, task_name = self._get_task_runner_and_name(data.pop("name"))
 
         # Accept return codes other than 0
@@ -436,22 +431,23 @@ class CommandsMixin:
         command = task(**data)
         if command:
             command.accepted_return_code = return_code
-        GLib.idle_add(self.parent.cancel_button.set_sensitive, True)
         if isinstance(command, MonitoredCommand):
             # Monitor thread and continue when task has executed
-            GLib.idle_add(self.parent.attach_logger, command)
+            self.interpreter_ui_delegate.attach_log(command)
             self.heartbeat = GLib.timeout_add(1000, self._monitor_task, command)
             return "STOP"
         return None
 
+    @watch_errors(error_result=False)
     def _monitor_task(self, command):
         if not command.is_running:
             logger.debug("Return code: %s", command.return_code)
             if command.return_code not in (str(command.accepted_return_code), "0"):
                 raise ScriptingError(_("Command exited with code %s") % command.return_code)
+
             self._iter_commands()
             return False
-        return True
+        return True  # keep checking
 
     def write_file(self, params):
         """Write text to a file."""
@@ -596,9 +592,9 @@ class CommandsMixin:
         scummvm_found = False
         windows_override_found = False  # DOS games that also have a Windows executable
         for filename in file_list:
-            if "dosbox/dosbox.exe" in filename.lower():
+            if "dosbox.exe" in filename.lower():
                 dosbox_found = True
-            if "scummvm/scummvm.exe" in filename.lower():
+            if "scummvm.exe" in filename.lower():
                 scummvm_found = True
             if "_some_windows.exe" in filename.lower():
                 # There's not a good way to handle exceptions without extracting the .info file
@@ -606,14 +602,28 @@ class CommandsMixin:
                 windows_override_found = True
         if dosbox_found and not windows_override_found:
             self._extract_gog_game(file_id)
-            dosbox_config = {
-                "working_dir": "$GAMEDIR/DOSBOX",
-            }
+            if "DOSBOX" in os.listdir(self.target_path):
+                dosbox_config = {
+                    "working_dir": "$GAMEDIR/DOSBOX",
+                }
+            else:
+                dosbox_config = {}
+            single_conf = None
+            config_file = None
             for filename in os.listdir(self.target_path):
-                if filename.endswith("_single.conf"):
+                if filename == "dosbox.conf":
                     dosbox_config["main_file"] = filename
+                elif filename.endswith("_single.conf"):
+                    single_conf = filename
                 elif filename.endswith(".conf"):
-                    dosbox_config["config_file"] = filename
+                    config_file = filename
+            if single_conf:
+                dosbox_config["main_file"] = single_conf
+            if config_file:
+                if dosbox_config.get("main_file"):
+                    dosbox_config["config_file"] = config_file
+                else:
+                    dosbox_config["main_file"] = config_file
             self.installer.script["game"] = dosbox_config
             self.installer.runner = "dosbox"
         elif scummvm_found:
@@ -638,3 +648,23 @@ class CommandsMixin:
                 "executable": file_id,
                 "args": args
             })
+
+    def install_or_extract(self, file_id):
+        """Runs if file is executable or extracts if file is archive"""
+        file_path = self._get_file_path(file_id)
+        runner = self.installer.runner
+        if runner != "wine":
+            raise ScriptingError(_("install_or_extract only works with wine!"))
+        if file_path.endswith(".exe"):
+            params = {
+                "name": "wineexec",
+                "executable": file_id
+            }
+            return self.task(params)
+
+        slug = self.installer.game_slug
+        params = {
+            "file": file_id,
+            "dst": f"$GAMEDIR/drive_c/{slug}"
+        }
+        return self.extract(params)

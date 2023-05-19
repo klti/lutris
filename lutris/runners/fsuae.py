@@ -2,6 +2,7 @@ import os
 from collections import defaultdict
 from gettext import gettext as _
 
+from lutris import settings
 from lutris.runners.runner import Runner
 from lutris.util import system
 from lutris.util.display import DISPLAY_MANAGER
@@ -229,14 +230,17 @@ class fsuae(Runner):
                 "Files ending in .hdf will be mounted as hard drives and "
                 "ISOs can be used for Amiga CD32 and CDTV models."
             ),
-        }, {
+        },
+        {
             "option": "disks",
+            "section": _("Media"),
             "type": "multiple",
             "label": _("Additionnal floppies"),
             "default_path": "game_path",
             "help": _("The additional floppy disk image(s)."),
         }, {
             "option": "cdrom_image",
+            "section": _("Media"),
             "label": _("CD-ROM image"),
             "type": "file",
             "help": _("CD-ROM image to use on non CD32/CDTV models")
@@ -254,6 +258,7 @@ class fsuae(Runner):
         },
         {
             "option": "kickstart_file",
+            "section": _("Kickstart"),
             "label": _("Kickstart ROMs location"),
             "type": "file",
             "help": _(
@@ -266,6 +271,7 @@ class fsuae(Runner):
         },
         {
             "option": "kickstart_ext_file",
+            "section": _("Kickstart"),
             "label": _("Extended Kickstart location"),
             "type": "file",
             "advanced": True,
@@ -273,17 +279,45 @@ class fsuae(Runner):
         },
         {
             "option": "gfx_fullscreen_amiga",
+            "section": _("Graphics"),
             "label": _("Fullscreen (F12 + S to switch)"),
             "type": "bool",
             "default": False,
         },
         {
             "option": "scanlines",
+            "section": _("Graphics"),
             "label": _("Scanlines display style"),
             "type": "bool",
             "default": False,
             "help": _("Activates a display filter adding scanlines to imitate "
                       "the displays of yesteryear."),
+        },
+        {
+            "option": "grafixcard",
+            "section": _("Graphics"),
+            "label": _("Graphics Card"),
+            "type": "choice",
+            "choices": gpucard_choices,
+            "default": "None",
+            "advanced": True,
+            "help": _(
+                "Use this option to enable a graphics card. This option is none by default, in "
+                "which case only chipset graphics (OCS/ECS/AGA) support is available."
+            )
+        },
+        {
+            "option": "grafixmemory",
+            "section": _("Graphics"),
+            "label": _("Graphics Card RAM"),
+            "type": "choice",
+            "choices": gpumem_choices,
+            "default": "0",
+            "advanced": True,
+            "help": _(
+                "Override the amount of graphics memory on the graphics card. The 0 MB option is "
+                "not really valid, but exists for user interface reasons."
+            )
         },
         {
             "option": "cpumodel",
@@ -318,6 +352,7 @@ class fsuae(Runner):
         },
         {
             "option": "fdvolume",
+            "section": _("Media"),
             "label": _("Floppy Drive Volume"),
             "type": "choice",
             "choices": flsound_choices,
@@ -328,6 +363,7 @@ class fsuae(Runner):
         },
         {
             "option": "fdspeed",
+            "section": _("Media"),
             "label": _("Floppy Drive Speed"),
             "type": "choice",
             "choices": flspeed_choices,
@@ -338,30 +374,6 @@ class fsuae(Runner):
                 "For example, you can specify 800 to get an 8x increase in "
                 "speed. Use 0 to specify turbo mode. Turbo mode means that "
                 "all floppy operations complete immediately. The default is 100 for most models."
-            )
-        },
-        {
-            "option": "grafixcard",
-            "label": _("Graphics Card"),
-            "type": "choice",
-            "choices": gpucard_choices,
-            "default": "None",
-            "advanced": True,
-            "help": _(
-                "Use this option to enable a graphics card. This option is none by default, in "
-                "which case only chipset graphics (OCS/ECS/AGA) support is available."
-            )
-        },
-        {
-            "option": "grafixmemory",
-            "label": _("Graphics Card RAM"),
-            "type": "choice",
-            "choices": gpumem_choices,
-            "default": "0",
-            "advanced": True,
-            "help": _(
-                "Override the amount of graphics memory on the graphics card. The 0 MB option is "
-                "not really valid, but exists for user interface reasons."
             )
         },
         {
@@ -387,8 +399,8 @@ class fsuae(Runner):
             "default": False,
             "advanced": True,
             "help":
-            _("Warn if running with a CPU governor other than performance. "
-              "Set to true to disable the warning.")
+                _("Warn if running with a CPU governor other than performance. "
+                  "Set to true to disable the warning.")
         },
         {
             "option": "bsdsocket",
@@ -398,6 +410,10 @@ class fsuae(Runner):
             "advanced": True,
         },
     ]
+
+    @property
+    def directory(self):
+        return os.path.join(settings.RUNNER_DIR, "fs-uae")
 
     def get_platform(self):
         model = self.runner_config.get("model")

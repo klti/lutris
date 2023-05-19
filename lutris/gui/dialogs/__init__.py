@@ -4,12 +4,14 @@ from gettext import gettext as _
 
 import gi
 
+gi.require_version('Gdk', '3.0')
 gi.require_version('Gtk', '3.0')
 
 from gi.repository import Gdk, GLib, GObject, Gtk
 
 from lutris import api, settings
 from lutris.gui.widgets.log_text_view import LogTextView
+from lutris.migrations import migrate
 from lutris.util import datapath
 from lutris.util.jobs import AsyncCall
 from lutris.util.log import logger
@@ -17,24 +19,44 @@ from lutris.util.log import logger
 
 class Dialog(Gtk.Dialog):
 
-    def __init__(self, title=None, parent=None, flags=0, buttons=None):
-        super().__init__(title, parent, flags, buttons)
-        self.set_border_width(10)
+    def __init__(self, title=None, parent=None, flags=0, buttons=None, **kwargs):
+        super().__init__(title, parent, flags, buttons, **kwargs)
         self.connect("delete-event", self.on_destroy)
         self.set_destroy_with_parent(True)
 
     def on_destroy(self, _widget, _data=None):
         self.destroy()
 
+    def add_styled_button(self, button_text, response_id, css_class):
+        button = self.add_button(button_text, response_id)
+        if css_class:
+            style_context = button.get_style_context()
+            style_context.add_class(css_class)
+        return button
+
+    def add_default_button(self, button_text, response_id, css_class="suggested-action"):
+        """Adds a button to the dialog with a particular response id, but
+        also makes it the default and styles it as the suggested action."""
+        button = self.add_styled_button(button_text, response_id, css_class)
+        self.set_default_response(response_id)
+        return button
+
+
+class ModalDialog(Dialog):
+    """A base class of moodal dialogs, which sets the flag for you."""
+
+    def __init__(self, title=None, parent=None, flags=0, buttons=None, **kwargs):
+        super().__init__(title, parent, flags | Gtk.DialogFlags.MODAL, buttons, **kwargs)
+
 
 class ModelessDialog(Dialog):
     """A base class for modeless dialogs. They have a parent only temporarily, so
-    they can be centered over it during creation. But eahc modeless dialog gets
-    its own window group, so it treats modal dialogs separately, and it resets
-    its transion-for after being created."""
+    they can be centered over it during creation. But each modeless dialog gets
+    its own window group, so it treats its own modal dialogs separately, and it resets
+    its transient-for after being created."""
 
-    def __init__(self, title=None, parent=None, flags=0, buttons=None):
-        super().__init__(title, parent, flags, buttons)
+    def __init__(self, title=None, parent=None, flags=0, buttons=None, **kwargs):
+        super().__init__(title, parent, flags, buttons, **kwargs)
         # These are not stuck above the 'main' window, but can be
         # re-ordered freely.
         self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
@@ -48,7 +70,7 @@ class ModelessDialog(Dialog):
 
     def _clear_transient_for(self):
         # we need the parent set to be centered over the parent, but
-        # we don't want to be transient really- we want other windows
+        # we don't want to be transient really - we want other windows
         # able to come to the front.
         self.set_transient_for(None)
         return False
@@ -107,13 +129,39 @@ class AboutDialog(GtkBuilderDialog):
 
 
 class NoticeDialog(Gtk.MessageDialog):
-
     """Display a message to the user."""
 
-    def __init__(self, message, parent=None):
-        super().__init__(buttons=Gtk.ButtonsType.OK, parent=parent)
+    def __init__(self, message, secondary=None, parent=None):
+        super().__init__(message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, parent=parent)
         self.set_markup(message)
+        if secondary:
+            self.format_secondary_text(secondary[:256])
+
+        # So you can copy warning text
+        for child in self.get_message_area().get_children():
+            if isinstance(child, Gtk.Label):
+                child.set_selectable(True)
+
         self.run()
+        self.destroy()
+
+
+class WarningDialog(Gtk.MessageDialog):
+    """Display a warning to the user, who responds with whether to proceed, like
+    a QuestionDialog."""
+
+    def __init__(self, message, secondary=None, parent=None):
+        super().__init__(message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.OK_CANCEL, parent=parent)
+        self.set_markup(message)
+        if secondary:
+            self.format_secondary_text(secondary[:256])
+
+        # So you can copy warning text
+        for child in self.get_message_area().get_children():
+            if isinstance(child, Gtk.Label):
+                child.set_selectable(True)
+
+        self.result = self.run()
         self.destroy()
 
 
@@ -127,12 +175,17 @@ class ErrorDialog(Gtk.MessageDialog):
         self.set_markup(message[:256])
         if secondary:
             self.format_secondary_text(secondary[:256])
+
+        # So you can copy error text
+        for child in self.get_message_area().get_children():
+            if isinstance(child, Gtk.Label):
+                child.set_selectable(True)
+
         self.run()
         self.destroy()
 
 
 class QuestionDialog(Gtk.MessageDialog):
-
     """Ask the user a question."""
 
     YES = Gtk.ResponseType.YES
@@ -152,7 +205,6 @@ class QuestionDialog(Gtk.MessageDialog):
 
 
 class DirectoryDialog:
-
     """Ask the user to select a directory."""
 
     def __init__(self, message, default_path=None, parent=None):
@@ -173,10 +225,9 @@ class DirectoryDialog:
 
 
 class FileDialog:
-
     """Ask the user to select a file."""
 
-    def __init__(self, message=None, default_path=None, mode="open"):
+    def __init__(self, message=None, default_path=None, mode="open", parent=None):
         self.filename = None
         if not message:
             message = _("Please choose a file")
@@ -186,7 +237,7 @@ class FileDialog:
             action = Gtk.FileChooserAction.OPEN
         dialog = Gtk.FileChooserNative.new(
             message,
-            None,
+            parent,
             action,
             _("_OK"),
             _("_Cancel"),
@@ -203,8 +254,10 @@ class FileDialog:
 
 class LutrisInitDialog(Gtk.Dialog):
 
-    def __init__(self, init_lutris):
+    def __init__(self, runtime_updater):
         super().__init__()
+        self.runtime_updater = runtime_updater
+
         self.set_size_request(320, 60)
         self.set_border_width(24)
         self.set_decorated(False)
@@ -217,19 +270,26 @@ class LutrisInitDialog(Gtk.Dialog):
         self.get_content_area().add(vbox)
         self.progress_timeout = GLib.timeout_add(125, self.show_progress)
         self.show_all()
+
+        self.connect("response", self.on_response)
         self.connect("destroy", self.on_destroy)
-        AsyncCall(self.initialize, self.init_cb, init_lutris)
+        AsyncCall(self.run_init, self.init_cb)
 
     def show_progress(self):
         self.progress.pulse()
         return True
 
-    def initialize(self, init_lutris, *args):
-        init_lutris()
+    def run_init(self):
+        migrate()
+        self.runtime_updater.update_runtimes()
 
     def init_cb(self, _result, error):
         if error:
-            ErrorDialog(str(error))
+            ErrorDialog(str(error), parent=self)
+        self.destroy()
+
+    def on_response(self, _widget, response):
+        self.runtime_updater.cancel()
         self.destroy()
 
     def on_destroy(self, window):
@@ -237,16 +297,18 @@ class LutrisInitDialog(Gtk.Dialog):
         return True
 
 
-class InstallOrPlayDialog(Gtk.Dialog):
+class InstallOrPlayDialog(ModalDialog):
 
-    def __init__(self, game_name):
-        Gtk.Dialog.__init__(self, _("%s is already installed") % game_name)
-        self.connect("delete-event", lambda *x: self.destroy())
+    def __init__(self, game_name, parent=None):
+        super().__init__(title=_("%s is already installed") % game_name, parent=parent, border_width=10)
         self.action = "play"
         self.action_confirmed = False
 
+        self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
+        self.add_default_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        self.connect("response", self.on_response)
+
         self.set_size_request(320, 120)
-        self.set_border_width(12)
         vbox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 6)
         self.get_content_area().add(vbox)
         play_button = Gtk.RadioButton.new_with_label_from_widget(None, _("Launch game"))
@@ -257,31 +319,32 @@ class InstallOrPlayDialog(Gtk.Dialog):
         install_button.connect("toggled", self.on_button_toggled, "install")
         vbox.pack_start(install_button, False, False, 0)
 
-        confirm_button = Gtk.Button(_("OK"))
-        confirm_button.connect("clicked", self.on_confirm)
-        vbox.pack_start(confirm_button, False, False, 0)
-
         self.show_all()
         self.run()
 
-    def on_button_toggled(self, button, action):  # pylint: disable=unused-argument
+    def on_button_toggled(self, _button, action):
         logger.debug("Action set to %s", action)
         self.action = action
 
-    def on_confirm(self, button):  # pylint: disable=unused-argument
-        logger.debug("Action %s confirmed", self.action)
-        self.action_confirmed = True
+    def on_response(self, _widget, response):
+        logger.debug("Dialog response %s", response)
+        if response == Gtk.ResponseType.CANCEL:
+            self.action = None
         self.destroy()
 
 
-class LaunchConfigSelectDialog(Gtk.Dialog):
-    def __init__(self, game, configs):
-        Gtk.Dialog.__init__(self, _("Select game to launch"))
-        self.connect("delete-event", lambda *x: self.destroy())
+class LaunchConfigSelectDialog(ModalDialog):
+    def __init__(self, game, configs, title, parent=None, has_dont_show_again=False):
+        super().__init__(title=title, parent=parent, border_width=10)
         self.config_index = 0
+        self.dont_show_again = False
         self.confirmed = False
+
+        self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
+        self.add_default_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        self.connect("response", self.on_response)
+
         self.set_size_request(320, 120)
-        self.set_border_width(12)
         vbox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 6)
         self.get_content_area().add(vbox)
 
@@ -294,16 +357,10 @@ class LaunchConfigSelectDialog(Gtk.Dialog):
             _button.connect("toggled", self.on_button_toggled, i + 1)
             vbox.pack_start(_button, False, False, 0)
 
-        button_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 6)
-        button_box.set_halign(Gtk.Align.END)
-        cancel_button = Gtk.Button(_("Cancel"))
-        cancel_button.connect("clicked", self.on_cancel)
-        button_box.pack_start(cancel_button, False, False, 0)
-
-        confirm_button = Gtk.Button(_("OK"))
-        confirm_button.connect("clicked", self.on_confirm)
-        button_box.pack_start(confirm_button, False, False, 0)
-        vbox.pack_start(button_box, False, False, 0)
+        if has_dont_show_again:
+            dont_show_checkbutton = Gtk.CheckButton(_("Do not ask again for this game."))
+            dont_show_checkbutton.connect("toggled", self.on_dont_show_checkbutton_toggled)
+            vbox.pack_end(dont_show_checkbutton, False, False, 6)
 
         self.show_all()
         self.run()
@@ -311,12 +368,11 @@ class LaunchConfigSelectDialog(Gtk.Dialog):
     def on_button_toggled(self, _button, index):
         self.config_index = index
 
-    def on_cancel(self, _button):
-        self.confirmed = False
-        self.destroy()
+    def on_dont_show_checkbutton_toggled(self, _button):
+        self.dont_show_again = _button.get_active()
 
-    def on_confirm(self, _button):
-        self.confirmed = True
+    def on_response(self, _widget, response):
+        self.confirmed = response == Gtk.ResponseType.OK
         self.destroy()
 
 
@@ -324,8 +380,8 @@ class ClientLoginDialog(GtkBuilderDialog):
     glade_file = "dialog-lutris-login.ui"
     dialog_object = "lutris-login"
     __gsignals__ = {
-        "connected": (GObject.SignalFlags.RUN_LAST, None, (GObject.TYPE_PYOBJECT, )),
-        "cancel": (GObject.SignalFlags.RUN_LAST, None, (GObject.TYPE_PYOBJECT, )),
+        "connected": (GObject.SignalFlags.RUN_LAST, None, (GObject.TYPE_PYOBJECT,)),
+        "cancel": (GObject.SignalFlags.RUN_LAST, None, (GObject.TYPE_PYOBJECT,)),
     }
 
     def __init__(self, parent):
@@ -367,14 +423,16 @@ class ClientLoginDialog(GtkBuilderDialog):
             self.dialog.destroy()
 
 
-class InstallerSourceDialog(Gtk.Dialog):
-
+class InstallerSourceDialog(ModelessDialog):
     """Show install script source"""
 
     def __init__(self, code, name, parent):
-        Gtk.Dialog.__init__(self, _("Install script for {}").format(name), parent=parent)
+        super().__init__(title=_("Install script for {}").format(name), parent=parent, border_width=0)
         self.set_size_request(500, 350)
-        self.set_border_width(0)
+
+        ok_button = self.add_default_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        ok_button.set_border_width(10)
+        self.connect("response", self.on_response)
 
         self.scrolled_window = Gtk.ScrolledWindow()
         self.scrolled_window.set_hexpand(True)
@@ -385,21 +443,17 @@ class InstallerSourceDialog(Gtk.Dialog):
 
         source_box = LogTextView(source_buffer, autoscroll=False)
 
+        self.get_content_area().set_border_width(0)
         self.get_content_area().add(self.scrolled_window)
         self.scrolled_window.add(source_box)
 
-        close_button = Gtk.Button(_("OK"))
-        close_button.connect("clicked", self.on_close)
-        self.get_content_area().add(close_button)
-
         self.show_all()
 
-    def on_close(self, *args):  # pylint: disable=unused-argument
+    def on_response(self, *args):
         self.destroy()
 
 
 class DontShowAgainDialog(Gtk.MessageDialog):
-
     """Display a message to the user and offer an option not to display this dialog again."""
 
     def __init__(
@@ -409,15 +463,19 @@ class DontShowAgainDialog(Gtk.MessageDialog):
         secondary_message=None,
         parent=None,
         checkbox_message=None,
+        cancellable=False
     ):
         # pylint: disable=no-member
         if settings.read_setting(setting) == "True":
             logger.info("Dialog %s dismissed by user", setting)
+            self.result = Gtk.ResponseType.OK
             return
 
-        super().__init__(type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.OK, parent=parent)
+        buttons = Gtk.ButtonsType.OK_CANCEL if cancellable else Gtk.ButtonsType.OK
 
-        self.set_border_width(12)
+        super().__init__(type=Gtk.MessageType.WARNING, buttons=buttons, parent=parent)
+
+        self.set_default_response(Gtk.ResponseType.OK)
         self.set_markup("<b>%s</b>" % message)
         if secondary_message:
             self.props.secondary_use_markup = True
@@ -432,17 +490,16 @@ class DontShowAgainDialog(Gtk.MessageDialog):
 
         content_area = self.get_content_area()
         content_area.pack_start(dont_show_checkbutton, False, False, 0)
-        self.run()
-        if dont_show_checkbutton.get_active():
+        self.result = self.run()
+        if self.result == Gtk.ResponseType.OK and dont_show_checkbutton.get_active():
             settings.write_setting(setting, True)
         self.destroy()
 
 
 class WineNotInstalledWarning(DontShowAgainDialog):
-
     """Display a warning if Wine is not detected on the system"""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, cancellable=False):
         super().__init__(
             "hide-wine-systemwide-install-warning",
             _("Wine is not installed on your system."),
@@ -450,27 +507,27 @@ class WineNotInstalledWarning(DontShowAgainDialog):
                 "Having Wine installed on your system guarantees that "
                 "Wine builds from Lutris will have all required dependencies.\n\nPlease "
                 "follow the instructions given in the <a "
-                "href='https://github.com/lutris/lutris/wiki/Wine-Dependencies'>Lutris Wiki</a> to "
+                "href='https://github.com/lutris/docs/blob/master/WineDependencies.md'>Lutris Wiki</a> to "
                 "install Wine."
             ),
             parent=parent,
+            cancellable=cancellable
         )
 
 
-class MoveDialog(Gtk.Dialog):
+class MoveDialog(ModelessDialog):
     __gsignals__ = {
         "game-moved": (GObject.SIGNAL_RUN_FIRST, None, ()),
     }
 
-    def __init__(self, game, destination):
-        super().__init__()
+    def __init__(self, game, destination, parent=None):
+        super().__init__(parent=parent, border_width=24)
 
         self.game = game
         self.destination = destination
         self.new_directory = None
 
         self.set_size_request(320, 60)
-        self.set_border_width(24)
         self.set_decorated(False)
         vbox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 12)
         label = Gtk.Label(_("Moving %s to %s..." % (game, destination)))
@@ -494,6 +551,56 @@ class MoveDialog(Gtk.Dialog):
 
     def on_game_moved(self, _result, error):
         if error:
-            ErrorDialog(str(error))
+            ErrorDialog(str(error), parent=self)
         self.emit("game-moved")
+        self.destroy()
+
+
+class HumbleBundleCookiesDialog(ModalDialog):
+    def __init__(self, parent=None):
+        super().__init__(_("Humble Bundle Cookie Authentication"), parent)
+        self.cookies_content = None
+        self.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
+        self.add_default_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        self.connect("response", self.on_response)
+
+        self.set_size_request(640, 512)
+
+        vbox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 6)
+        self.get_content_area().add(vbox)
+        label = Gtk.Label()
+        label.set_markup(_(
+            "<b>Humble Bundle Authentication via cookie import</b>\n"
+            "\n"
+            "<b>In Firefox</b>\n"
+            "- Install the follwing extension: "
+            "<a href='https://addons.mozilla.org/en-US/firefox/addon/export-cookies-txt/'>"
+            "https://addons.mozilla.org/en-US/firefox/addon/export-cookies-txt/"
+            "</a>\n"
+            "- Open a tab to humblebundle.com and make sure you are logged in.\n"
+            "- Click the cookie icon in the top right corner, next to the settings menu\n"
+            "- Check 'Prefix HttpOnly cookies' and click 'humblebundle.com'\n"
+            "- Open the generated file and paste the contents below. Click OK to finish.\n"
+            "- You can delete the cookies file generated by Firefox\n"
+            "- Optionally, <a href='https://support.humblebundle.com/hc/en-us/requests/new'>"
+            "open a support ticket</a> to ask Humble Bundle to fix their configuration."
+        ))
+        vbox.pack_start(label, False, False, 24)
+        self.textview = Gtk.TextView()
+        self.textview.set_left_margin(12)
+        self.textview.set_right_margin(12)
+        scrolledwindow = Gtk.ScrolledWindow()
+        scrolledwindow.set_hexpand(True)
+        scrolledwindow.set_vexpand(True)
+        scrolledwindow.add(self.textview)
+        vbox.pack_start(scrolledwindow, True, True, 24)
+        self.show_all()
+        self.run()
+
+    def on_response(self, _widget, response):
+        if response == Gtk.ResponseType.CANCEL:
+            self.cookies_content = None
+        else:
+            buffer = self.textview.get_buffer()
+            self.cookies_content = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
         self.destroy()

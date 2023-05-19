@@ -79,7 +79,7 @@ class LutrisStatusIcon:
         """Callback to show or hide the window"""
         app_window = self.application.window
         if app_window.get_visible():
-            # If the wndow has any transients, hiding it will hide them too
+            # If the window has any transients, hiding it will hide them too
             # never to be shown again, which is broken. So we don't allow that.
             windows = Gtk.Window.list_toplevels()
             for w in windows:
@@ -96,7 +96,7 @@ class LutrisStatusIcon:
 
     def on_quit_application(self, _widget):
         """Callback to quit the program"""
-        self.application.do_shutdown()
+        self.application.quit()
 
     def _make_menu_item_for_game(self, game):
         menu_item = Gtk.MenuItem()
@@ -115,7 +115,8 @@ class LutrisStatusIcon:
         return installed_games
 
     def on_game_selected(self, _widget, game_id):
-        Game(game_id).launch()
+        launch_ui_delegate = self.application.get_launch_ui_delegate()
+        Game(game_id).launch(launch_ui_delegate)
 
 
 class LutrisTray(Gtk.StatusIcon):

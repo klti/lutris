@@ -1,7 +1,7 @@
 Source: lutris
 Section: games
 Priority: optional
-Maintainer: Mathieu Comandon <strider@strycore.com>
+Maintainer: Mathieu Comandon <mathieucomandon@gmail.com>
 Build-Depends: debhelper-compat (= 12),
                appstream,
                dh-sequence-python3,
@@ -26,7 +26,7 @@ Depends: ${misc:Depends},
          python3-distro,
          python3-dbus,
          gir1.2-gtk-3.0,
-         gir1.2-webkit2-4.0,
+         gir1.2-webkit2-4.0 | gir1.2-webkit2-4.1,
          gir1.2-notify-0.7,
          psmisc,
          cabextract,
@@ -37,8 +37,9 @@ Depends: ${misc:Depends},
          x11-xserver-utils,
          mesa-utils,
 Recommends: python3-evdev,
+            python3-protobuf,
             gvfs-backends,
-            libwine-development,
+            libwine-development | libwine,
             winetricks,
 Suggests: gamemode,
           gamescope,

@@ -34,6 +34,7 @@ class DieselGameMedia(ServiceMedia):
     service = "egs"
     remote_size = (200, 267)
     file_pattern = "%s.jpg"
+    file_format = "jpeg"
     min_logo_x = 300
     min_logo_y = 150
 
@@ -107,6 +108,7 @@ class DieselGameBoxLogo(DieselGameMedia):
     size = (200, 100)
     remote_size = size
     file_pattern = "%s.png"
+    file_format = "png"
     visible = False
     dest_path = os.path.join(settings.CACHE_DIR, "egs/game_logo")
     api_field = "DieselGameBoxLogo"
@@ -150,12 +152,13 @@ class EpicGamesStoreService(OnlineService):
     cookies_path = os.path.join(settings.CACHE_DIR, ".egs.auth")
     token_path = os.path.join(settings.CACHE_DIR, ".egs.token")
     cache_path = os.path.join(settings.CACHE_DIR, "egs-library.json")
-    login_url = "https://www.epicgames.com/id/login?redirectUrl=https://www.epicgames.com/id/api/redirect"
+    login_url = ("https://www.epicgames.com/id/login?redirectUrl="
+                 "https%3A//www.epicgames.com/id/api/redirect%3F"
+                 "clientId%3D34a02cf8f4414e29b15921876da36f9a%26responseType%3Dcode")
     redirect_uri = "https://www.epicgames.com/id/api/redirect"
     oauth_url = 'https://account-public-service-prod03.ol.epicgames.com'
     catalog_url = 'https://catalog-public-service-prod06.ol.epicgames.com'
     library_url = 'https://library-service.live.use1a.on.epicgames.com'
-    is_loading = False
 
     user_agent = (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -200,28 +203,9 @@ class EpicGamesStoreService(OnlineService):
         logger.debug("Login to EGS successful")
         logger.debug(content)
         content_json = json.loads(content.decode())
-        session_id = content_json["sid"]
-        _session = requests.session()
-        _session.headers.update({
-            'X-Epic-Event-Action': 'login',
-            'X-Epic-Event-Category': 'login',
-            'X-Epic-Strategy-Flags': '',
-            'X-Requested-With': 'XMLHttpRequest',
-            'User-Agent': self.user_agent
-        })
+        session_id = content_json["authorizationCode"]
 
-        _session.get('https://www.epicgames.com/id/api/set-sid', params={'sid': session_id})
-        _session.get('https://www.epicgames.com/id/api/csrf')
-        response = _session.post(
-            'https://www.epicgames.com/id/api/exchange/generate',
-            headers={'X-XSRF-TOKEN': _session.cookies['XSRF-TOKEN']}
-        )
-
-        if response.status_code != 200:
-            logger.error("Failed to connec to EGS (Status %s): %s", response.status_code, response.json())
-            return
-
-        self.start_session(response.json()['code'])
+        self.start_session(authorization_code=session_id)
         self.emit("service-login")
 
     def resume_session(self):
@@ -235,21 +219,29 @@ class EpicGamesStoreService(OnlineService):
             raise RuntimeError(response_content)
         return response_content
 
-    def start_session(self, exchange_code=None):
+    def start_session(self, exchange_code=None, authorization_code=None):
         if exchange_code:
-            grant_type = 'exchange_code'
-            token = exchange_code
+            params = {
+                'grant_type': 'exchange_code',
+                'exchange_code': exchange_code,
+                'token_type': 'eg1'
+            }
+        elif authorization_code:
+            params = {
+                'grant_type': 'authorization_code',
+                'code': authorization_code,
+                'token_type': 'eg1'
+            }
         else:
-            grant_type = 'refresh_token'
-            token = self.session_data["refresh_token"]
+            params = {
+                'grant_type': 'refresh_token',
+                'refresh_token': self.session_data["refresh_token"],
+                'token_type': 'eg1'
+            }
 
         response = self.session.post(
             'https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/token',
-            data={
-                'grant_type': grant_type,
-                grant_type: token,
-                'token_type': 'eg1'
-            },
+            data=params,
             auth=self.http_basic_auth
         )
         if response.status_code >= 500:
@@ -311,14 +303,9 @@ class EpicGamesStoreService(OnlineService):
 
     def load(self):
         """Load the list of games"""
-        if self.is_loading:
-            logger.warning("EGS games are already loading")
-            return
-        self.is_loading = True
         try:
             library = self.get_library()
         except Exception as ex:  # pylint=disable:broad-except
-            self.is_loading = False
             logger.warning("EGS Token expired")
             raise AuthTokenExpired from ex
         egs_games = []
@@ -326,7 +313,6 @@ class EpicGamesStoreService(OnlineService):
             egs_game = EGSGame.new_from_api(game)
             egs_game.save()
             egs_games.append(egs_game)
-        self.is_loading = False
         return egs_games
 
     def install_from_egs(self, egs_game, manifest):

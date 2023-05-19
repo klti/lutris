@@ -1,7 +1,7 @@
 from lutris import settings
-from lutris.util.log import logger
 from lutris.api import get_api_games
 from lutris.database.games import get_games, sql
+from lutris.util.log import logger
 
 
 def migrate():
@@ -15,7 +15,6 @@ def migrate():
     games = get_api_games(slugs_to_update)
     for game in games:
         if not game['discord_id']:
-            logger.info("%s doesn't have Discord APP Id", game['name'])
             continue
 
         sql.db_update(

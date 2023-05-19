@@ -1,8 +1,14 @@
 """Check to run at program start"""
 import os
 import sqlite3
-import time
 from gettext import gettext as _
+
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+
+from gi.repository import GdkPixbuf
 
 from lutris import runners, settings
 from lutris.database.games import delete_game, get_games, get_games_where
@@ -11,17 +17,18 @@ from lutris.game import Game
 from lutris.gui.dialogs import DontShowAgainDialog
 from lutris.runners.json import load_json_runners
 from lutris.runtime import RuntimeUpdater
+from lutris.scanners.lutris import build_path_cache
 from lutris.services import DEFAULT_SERVICES
 from lutris.services.lutris import sync_media
-from lutris.util import update_cache
+from lutris.util.display import USE_DRI_PRIME
 from lutris.util.graphics import drivers, vkquery
 from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import logger
 from lutris.util.steam.shortcut import update_all_artwork
-from lutris.util.system import create_folder
+from lutris.util.system import create_folder, preload_vulkan_gpu_names
 from lutris.util.wine.d3d_extras import D3DExtrasManager
 from lutris.util.wine.dgvoodoo2 import dgvoodoo2Manager
-from lutris.util.wine.dxvk import DXVKManager
+from lutris.util.wine.dxvk import REQUIRED_VULKAN_API_VERSION, DXVKManager
 from lutris.util.wine.dxvk_nvapi import DXVKNVAPIManager
 from lutris.util.wine.vkd3d import VKD3DManager
 
@@ -117,7 +124,7 @@ def check_libs(all_components=False):
         if settings.read_setting(setting) != "True":
             DontShowAgainDialog(
                 setting,
-                _("Missing vulkan libraries"),
+                _("Missing Vulkan libraries"),
                 secondary_message=_(
                     "Lutris was unable to detect Vulkan support for "
                     "the %s architecture.\n"
@@ -135,6 +142,31 @@ def check_vulkan():
     """Reports if Vulkan is enabled on the system"""
     if not vkquery.is_vulkan_supported():
         logger.warning("Vulkan is not available or your system isn't Vulkan capable")
+    else:
+        required_api_version = REQUIRED_VULKAN_API_VERSION
+        library_api_version = vkquery.get_vulkan_api_version()
+        if library_api_version and library_api_version < required_api_version:
+            logger.warning("Vulkan reports an API version of %s. "
+                           "%s is required for the latest DXVK.",
+                           vkquery.format_version(library_api_version),
+                           vkquery.format_version(required_api_version))
+
+        devices = vkquery.get_device_info()
+
+        if devices and devices[0].api_version < required_api_version:
+            logger.warning("Vulkan reports that the '%s' device has API version of %s. "
+                           "%s is required for the latest DXVK.",
+                           devices[0].name,
+                           vkquery.format_version(devices[0].api_version),
+                           vkquery.format_version(required_api_version))
+
+
+def check_gnome():
+    required_names = ['svg', 'png', 'jpeg']
+    format_names = [f.get_name() for f in GdkPixbuf.Pixbuf.get_formats()]
+    for required in required_names:
+        if required not in format_names:
+            logger.error("'%s' PixBuf support is not installed.", required.upper())
 
 
 def fill_missing_platforms():
@@ -149,7 +181,7 @@ def fill_missing_platforms():
         game.set_platform_from_runner()
         if game.platform:
             logger.info("Platform for %s set to %s", game.name, game.platform)
-            game.save(save_config=False)
+            game.save_platform()
 
 
 def run_all_checks():
@@ -157,7 +189,10 @@ def run_all_checks():
     check_driver()
     check_libs()
     check_vulkan()
+    check_gnome()
+    preload_vulkan_gpu_names(USE_DRI_PRIME)
     fill_missing_platforms()
+    build_path_cache()
 
 
 def cleanup_games():
@@ -173,15 +208,12 @@ def init_lutris():
     """Run full initialization of Lutris"""
     logger.info("Starting Lutris %s", settings.VERSION)
     runners.inject_runners(load_json_runners())
-    # Load runner names and platforms
-    runners.RUNNER_NAMES = runners.get_runner_names()
-    runners.RUNNER_PLATFORMS = runners.get_platforms()
     init_dirs()
     try:
         syncdb()
     except sqlite3.DatabaseError as err:
         raise RuntimeError(
-            "Failed to open database file in %s. Try renaming this file and relaunch Lutris" %
+            _("Failed to open database file in %s. Try renaming this file and relaunch Lutris") %
             settings.PGA_DB
         ) from err
     for service in DEFAULT_SERVICES:
@@ -190,26 +222,23 @@ def init_lutris():
     cleanup_games()
 
 
-def update_runtime(force=False):
-    """Update runtime components"""
-    runtime_call = update_cache.get_last_call("runtime")
-    if force or not runtime_call or runtime_call > 3600 * 12:
-        runtime_updater = RuntimeUpdater()
-        components_to_update = runtime_updater.update()
-        if components_to_update:
-            while runtime_updater.current_updates:
-                time.sleep(0.3)
-        update_cache.write_date_to_cache("runtime")
-    for dll_manager_class in (DXVKManager, DXVKNVAPIManager, VKD3DManager, D3DExtrasManager, dgvoodoo2Manager):
-        key = dll_manager_class.__name__
-        key_call = update_cache.get_last_call(key)
-        if force or not key_call or key_call > 3600 * 6:
-            dll_manager = dll_manager_class()
-            dll_manager.upgrade()
-            update_cache.write_date_to_cache(key)
-    media_call = update_cache.get_last_call("media")
-    if force or not media_call or media_call > 3600 * 24:
+class StartupRuntimeUpdater(RuntimeUpdater):
+    """Due to circular reference problems, we need to keep all these interesting
+    references here, out of runtime.py"""
+    dll_manager_classes = [DXVKManager, DXVKNVAPIManager, VKD3DManager, D3DExtrasManager, dgvoodoo2Manager]
+
+    def __init__(self, force=False):
+        super().__init__(force)
+        for dll_manager_class in self.dll_manager_classes:
+            key = dll_manager_class.__name__
+            self.add_update(key, lambda c=dll_manager_class: self._update_dll_manager(c), hours=6)
+
+        self.add_update("media", self._update_media, hours=240)
+
+    def _update_dll_manager(self, dll_manager_class):
+        dll_manager = dll_manager_class()
+        dll_manager.upgrade()
+
+    def _update_media(self):
         sync_media()
         update_all_artwork()
-        update_cache.write_date_to_cache("media")
-    logger.info("Startup complete")

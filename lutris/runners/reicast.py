@@ -8,7 +8,6 @@ from gettext import gettext as _
 
 # Lutris Modules
 from lutris import settings
-from lutris.gui.dialogs import NoticeDialog
 from lutris.runners.runner import Runner
 from lutris.util import joypad, system
 
@@ -45,6 +44,7 @@ class reicast(Runner):
             {
                 "option": "device_id_1",
                 "type": "choice",
+                "section": _("Gamepads"),
                 "label": _("Gamepad 1"),
                 "choices": self.get_joypads,
                 "default": "-1",
@@ -52,6 +52,7 @@ class reicast(Runner):
             {
                 "option": "device_id_2",
                 "type": "choice",
+                "section": _("Gamepads"),
                 "label": _("Gamepad 2"),
                 "choices": self.get_joypads,
                 "default": "-1",
@@ -59,6 +60,7 @@ class reicast(Runner):
             {
                 "option": "device_id_3",
                 "type": "choice",
+                "section": _("Gamepads"),
                 "label": _("Gamepad 3"),
                 "choices": self.get_joypads,
                 "default": "-1",
@@ -66,13 +68,14 @@ class reicast(Runner):
             {
                 "option": "device_id_4",
                 "type": "choice",
+                "section": _("Gamepads"),
                 "label": _("Gamepad 4"),
                 "choices": self.get_joypads,
                 "default": "-1",
             },
         ]
 
-    def install(self, version=None, downloader=None, callback=None):
+    def install(self, install_ui_delegate, version=None, callback=None):
 
         def on_runner_installed(*args):
             mapping_path = system.create_folder("~/.reicast/mappings")
@@ -81,9 +84,10 @@ class reicast(Runner):
                 shutil.copy(os.path.join(mapping_source, mapping_file), mapping_path)
 
             system.create_folder("~/.reicast/data")
-            NoticeDialog(_("You have to copy valid BIOS files to ~/.reicast/data before playing"))
+            install_ui_delegate.show_install_notice(
+                _("You have to copy valid BIOS files to ~/.reicast/data before playing"))
 
-        super().install(version, downloader, on_runner_installed)
+        super().install(install_ui_delegate, version, on_runner_installed)
 
     def get_joypads(self):
         """Return list of joypad in a format usable in the options"""
